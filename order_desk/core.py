@@ -100,5 +100,32 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def ship(self, order_id, carrier, tracking_no):
+        order_id = text(order_id, "order_id")
+        carrier = text(carrier, "carrier")
+        tracking_no = text(tracking_no, "tracking_no")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] == "cancelled":
+            raise ValueError("a cancelled order cannot be shipped")
+        if order["status"] == "shipped":
+            raise ValueError("order already shipped")
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can be shipped")
+        reservations = data.get("reservations", {}).pop(order_id, None)
+        if reservations:
+            inventory = data.get("inventory", {})
+            for sku, quantity in reservations.items():
+                entry = inventory.get(sku)
+                if entry is not None:
+                    entry["on_hand"] -= quantity
+                    entry["reserved"] -= quantity
+        order["status"] = "shipped"
+        order["shipment"] = {"carrier": carrier, "tracking_no": tracking_no}
+        self._write(data)
+        return order
+
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
