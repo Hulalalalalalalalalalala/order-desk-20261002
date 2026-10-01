@@ -129,3 +129,70 @@ class OrderDesk(JsonStore):
 
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
+
+    @staticmethod
+    def _order_quantities(order):
+        quantities = {}
+        for line in order["lines"]:
+            sku = line["sku"]
+            quantities[sku] = quantities.get(sku, 0) + line["quantity"]
+        return quantities
+
+    def record_return(self, order_id, return_id, lines):
+        order_id = text(order_id, "order_id")
+        return_id = text(return_id, "return_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "shipped":
+            raise ValueError("only a shipped order can be returned")
+        for records in data.get("returns", {}).values():
+            if return_id in records:
+                raise ValueError("return already exists: " + return_id)
+        original = self._order_quantities(order)
+        returned = {}
+        for record in data.get("returns", {}).get(order_id, {}).values():
+            for line in record:
+                sku = line["sku"]
+                returned[sku] = returned.get(sku, 0) + line["quantity"]
+        for sku, quantity in requested.items():
+            if sku not in original:
+                raise ValueError("sku not in order: " + sku)
+            if returned.get(sku, 0) + quantity > original[sku]:
+                raise ValueError("returned quantity exceeds ordered: " + sku)
+        record_lines = [{"sku": sku, "quantity": quantity} for sku, quantity in sorted(requested.items())]
+        record = {"order_id": order_id, "return_id": return_id, "lines": record_lines}
+        data.setdefault("returns", {}).setdefault(order_id, {})[return_id] = record_lines
+        self._write(data)
+        return record
+
+    def get_returns(self, order_id):
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        records = []
+        for return_id in sorted(data.get("returns", {}).get(order_id, {})):
+            record_lines = data["returns"][order_id][return_id]
+            records.append({"order_id": order_id, "return_id": return_id,
+                            "lines": [{"sku": line["sku"], "quantity": line["quantity"]} for line in record_lines]})
+        returned = {}
+        for record in data.get("returns", {}).get(order_id, {}).values():
+            for line in record:
+                sku = line["sku"]
+                returned[sku] = returned.get(sku, 0) + line["quantity"]
+        remaining = []
+        for sku, quantity in sorted(self._order_quantities(order).items()):
+            remaining.append({"sku": sku, "quantity": quantity - returned.get(sku, 0)})
+        return {"order_id": order_id, "records": records, "remaining": remaining}
