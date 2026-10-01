@@ -1,0 +1,13 @@
+{
+  "order_id": "ORD-001",
+  "lines": [
+    {
+      "sku": "TEA",
+      "quantity": 2
+    },
+    {
+      "sku": "CUP",
+      "quantity": 1
+    }
+  ]
+}

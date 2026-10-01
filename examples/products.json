@@ -1,0 +1,17 @@
+[
+  {
+    "sku": "TEA",
+    "name": "乌龙茶",
+    "price_cents": 2500
+  },
+  {
+    "sku": "CUP",
+    "name": "陶瓷杯",
+    "price_cents": 3600
+  },
+  {
+    "sku": "CARD",
+    "name": "感谢卡",
+    "price_cents": 0
+  }
+]

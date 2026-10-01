@@ -1,0 +1,11 @@
+Install
+python3 --version
+需要 Python 3.10+，仅标准库，无需下载依赖。
+
+Start
+python3 -m order_desk --root ./state demo
+输出一份 JSON 业务结果；演示使用临时样例目录。无需端口或账户。
+
+Smoke Test
+python3 -m unittest discover -s tests -v
+执行 API、持久化、错误路径和 CLI 检查；最终应为 OK。
