@@ -24,9 +24,11 @@ python3 -m order_desk --root ./state add-product examples/products.json
 JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后续失败不会回滚整批。重跑登记命令遇到已存在的标识会报错。
 
 - `add-product` → `OrderDesk.add_product(...)`。参数名见 `core.py` 的公开方法签名。
-- `place` → `OrderDesk.place(...)`。参数名见 `core.py` 的公开方法签名。
+- `restock` → `OrderDesk.restock(sku, quantity)`。补货只增加在库量，不改变预留量；商品首次成功补货后纳管库存。
+- `stock` → `OrderDesk.stock(sku)`。返回 `{sku, on_hand, reserved, available}`；未纳管商品的 `on_hand`、`available` 为 `null`，`reserved` 为 `0`。
+- `place` → `OrderDesk.place(...)`。对已纳管商品按合计数量检查并预留可用量（在库量减预留量），任一商品缺货则整笔订单不创建。
 - `get` → `OrderDesk.get(...)`。参数名见 `core.py` 的公开方法签名。
-- `cancel` → `OrderDesk.cancel(...)`。参数名见 `core.py` 的公开方法签名。
+- `cancel` → `OrderDesk.cancel(...)`。取消只释放该订单实际预留的数量，在库量不变。
 - `list` → `OrderDesk.list_orders(...)`。参数名见 `core.py` 的公开方法签名。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
@@ -37,4 +39,4 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 
 ## 当前边界
 
-当前仅支持一币种、一个商品目录和一次性取消。没有支付、发货、退货和库存预留功能。 不承诺并发写入或断电恢复。
+当前仅支持一币种、一个商品目录、一次性取消和按商品的库存预留。没有支付、发货、退货功能。 不承诺并发写入或断电恢复。

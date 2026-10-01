@@ -14,6 +14,34 @@ class OrderDesk(JsonStore):
         self._write(data)
         return product
 
+    def restock(self, sku, quantity):
+        sku = text(sku, "sku")
+        quantity = positive(quantity, "quantity")
+        data = self._read()
+        if sku not in data.get("products", {}):
+            raise ValueError("unknown product: " + sku)
+        inventory = data.setdefault("inventory", {})
+        entry = inventory.setdefault(sku, {"on_hand": 0, "reserved": 0})
+        entry["on_hand"] += quantity
+        self._write(data)
+        return self._stock_view(sku, entry)
+
+    def stock(self, sku):
+        sku = text(sku, "sku")
+        data = self._read()
+        if sku not in data.get("products", {}):
+            raise ValueError("unknown product: " + sku)
+        entry = data.get("inventory", {}).get(sku)
+        if entry is None:
+            return {"sku": sku, "on_hand": None, "reserved": 0, "available": None}
+        return self._stock_view(sku, entry)
+
+    @staticmethod
+    def _stock_view(sku, entry):
+        on_hand = entry["on_hand"]
+        reserved = entry["reserved"]
+        return {"sku": sku, "on_hand": on_hand, "reserved": reserved, "available": on_hand - reserved}
+
     def place(self, order_id, lines):
         order_id = text(order_id, "order_id")
         if not isinstance(lines, list) or not lines:
@@ -21,13 +49,30 @@ class OrderDesk(JsonStore):
         data = self._read()
         if order_id in data.get("orders", {}):
             raise ValueError("order already exists")
+        products = data.get("products", {})
         items = []
+        needed = {}
         for line in lines:
             sku, quantity = text(line["sku"], "sku"), positive(line["quantity"], "quantity")
-            product = data.get("products", {}).get(sku)
+            product = products.get(sku)
             if product is None:
                 raise ValueError("unknown product: " + sku)
             items.append({"sku": sku, "quantity": quantity, "unit_price_cents": product["price_cents"], "subtotal_cents": quantity * product["price_cents"]})
+            needed[sku] = needed.get(sku, 0) + quantity
+        inventory = data.get("inventory", {})
+        reservations = {}
+        for sku, quantity in needed.items():
+            entry = inventory.get(sku)
+            if entry is None:
+                continue
+            if quantity > entry["on_hand"] - entry["reserved"]:
+                raise ValueError("insufficient stock: " + sku)
+            reservations[sku] = quantity
+        if reservations:
+            inventory = data.setdefault("inventory", {})
+            for sku, quantity in reservations.items():
+                inventory[sku]["reserved"] += quantity
+            data.setdefault("reservations", {})[order_id] = reservations
         order = {"order_id": order_id, "status": "placed", "lines": items, "total_cents": sum(x["subtotal_cents"] for x in items)}
         data.setdefault("orders", {})[order_id] = order
         self._write(data)
@@ -44,6 +89,13 @@ class OrderDesk(JsonStore):
         order = data.get("orders", {}).get(order_id)
         if order is None or order["status"] != "placed":
             raise ValueError("only a placed order can be cancelled")
+        reservations = data.get("reservations", {}).pop(order_id, None)
+        if reservations:
+            inventory = data.get("inventory", {})
+            for sku, quantity in reservations.items():
+                entry = inventory.get(sku)
+                if entry is not None:
+                    entry["reserved"] -= quantity
         order["status"] = "cancelled"
         self._write(data)
         return order
