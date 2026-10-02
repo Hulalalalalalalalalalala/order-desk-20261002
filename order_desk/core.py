@@ -150,6 +150,14 @@ class OrderDesk(JsonStore):
         if not isinstance(lines, list) or not lines:
             raise ValueError("lines must be a nonempty list")
         data = self._read()
+        order = self._place(data, order_id, lines)
+        self._write(data)
+        return order
+
+    def _place(self, data, order_id, lines):
+        # Shared by place and checkout_cart: validates against the current
+        # catalog and inventory inside `data`, reserves stock and records the
+        # place event. Caller writes `data` once everything has succeeded.
         if order_id in data.get("orders", {}):
             raise ValueError("order already exists")
         products = data.get("products", {})
@@ -181,6 +189,55 @@ class OrderDesk(JsonStore):
         order = {"order_id": order_id, "status": "placed", "lines": items, "total_cents": sum(x["subtotal_cents"] for x in items)}
         data.setdefault("orders", {})[order_id] = order
         self._record_event(data, order_id, "place", order, True)
+        return order
+
+    def save_cart(self, cart_id, lines):
+        # Carts only remember what to buy: no prices, no reservations, no
+        # history. Paused or out-of-stock products may be saved; everything is
+        # re-checked against the catalog and stock at checkout time.
+        cart_id = text(cart_id, "cart_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        products = data.get("products", {})
+        for sku in requested:
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+        cart = {
+            "cart_id": cart_id,
+            "lines": [{"sku": sku, "quantity": requested[sku]} for sku in sorted(requested)],
+        }
+        # A new id creates the cart; an existing id is replaced wholesale.
+        data.setdefault("carts", {})[cart_id] = cart
+        self._write(data)
+        return cart
+
+    def get_cart(self, cart_id):
+        cart_id = text(cart_id, "cart_id")
+        cart = self._read().get("carts", {}).get(cart_id)
+        if cart is None:
+            raise ValueError("unknown cart: " + cart_id)
+        return copy.deepcopy(cart)
+
+    def checkout_cart(self, cart_id, order_id):
+        cart_id = text(cart_id, "cart_id")
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        cart = data.get("carts", {}).get(cart_id)
+        if cart is None:
+            raise ValueError("unknown cart: " + cart_id)
+        # Place against the current catalog and stock; _place validates
+        # everything before mutating, so a rejected checkout leaves the cart,
+        # orders, inventory and history untouched.
+        order = self._place(data, order_id, copy.deepcopy(cart["lines"]))
+        data.get("carts", {}).pop(cart_id, None)
         self._write(data)
         return order
 
