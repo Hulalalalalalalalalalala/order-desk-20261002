@@ -22,10 +22,49 @@ class OrderDesk(JsonStore):
         products = data.setdefault("products", {})
         if sku in products:
             raise ValueError("product already exists")
+        # New products sell by default; the enabled field is only persisted
+        # once an explicit status change is requested, so its absence means
+        # enabled for older products as well.
         product = {"sku": sku, "name": name, "price_cents": price_cents}
         products[sku] = product
         self._write(data)
         return product
+
+    @staticmethod
+    def _enabled(product):
+        # Products without an enabled field (including pre-feature records)
+        # are considered enabled; only a stored false value pauses sales.
+        return product.get("enabled", True) is not False
+
+    @staticmethod
+    def _product_view(product):
+        return {
+            "sku": product["sku"],
+            "name": product["name"],
+            "price_cents": product["price_cents"],
+            "enabled": product.get("enabled", True) is not False,
+        }
+
+    def set_product_enabled(self, sku, enabled):
+        sku = text(sku, "sku")
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        data = self._read()
+        product = data.get("products", {}).get(sku)
+        if product is None:
+            raise ValueError("unknown product: " + sku)
+        product["enabled"] = enabled
+        self._write(data)
+        return self._product_view(product)
+
+    def get_product(self, sku):
+        sku = text(sku, "sku")
+        product = self._read().get("products", {}).get(sku)
+        if product is None:
+            raise ValueError("unknown product: " + sku)
+        # Read-only: a missing enabled field is reported as true without
+        # being written back.
+        return self._product_view(product)
 
     def restock(self, sku, quantity):
         sku = text(sku, "sku")
@@ -125,6 +164,8 @@ class OrderDesk(JsonStore):
             product = products.get(sku)
             if product is None:
                 raise ValueError("unknown product: " + sku)
+            if not self._enabled(product):
+                raise ValueError("product is not selling: " + sku)
             items.append({"sku": sku, "quantity": quantity, "unit_price_cents": product["price_cents"], "subtotal_cents": quantity * product["price_cents"]})
             needed[sku] = needed.get(sku, 0) + quantity
         inventory = data.get("inventory", {})
@@ -173,6 +214,21 @@ class OrderDesk(JsonStore):
             if product is None:
                 raise ValueError("unknown product: " + sku)
             items.append({"sku": sku, "quantity": quantity, "unit_price_cents": product["price_cents"], "subtotal_cents": quantity * product["price_cents"]})
+        # Paused products keep their existing fulfilment path: an order may
+        # keep, reduce or remove them, but cannot add one it did not contain
+        # and cannot grow the combined quantity. Comparisons use the order's
+        # current lines (duplicate SKUs combined), never history or the size
+        # of its reservation record.
+        current = {}
+        for line in order["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        for sku, quantity in needed.items():
+            product = products[sku]
+            if not self._enabled(product):
+                if sku not in current:
+                    raise ValueError("cannot add a product that is not selling: " + sku)
+                if quantity > current[sku]:
+                    raise ValueError("cannot increase quantity of a product that is not selling: " + sku)
         inventory = data.get("inventory", {})
         own = data.get("reservations", {}).get(order_id, {})
         # New demand may use what is available plus what this order already
@@ -223,6 +279,8 @@ class OrderDesk(JsonStore):
             product = products.get(sku)
             if product is None:
                 raise ValueError("unknown product: " + sku)
+            if not self._enabled(product):
+                raise ValueError("product is not selling: " + sku)
             quantity = requested[sku]
             unit_price = product["price_cents"]
             entry = inventory.get(sku)

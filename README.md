@@ -23,12 +23,14 @@ python3 -m order_desk --root ./state add-product examples/products.json
 
 JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后续失败不会回滚整批。重跑登记命令遇到已存在的标识会报错。
 
-- `add-product` → `OrderDesk.add_product(...)`。参数名见 `core.py` 的公开方法签名。
+- `add-product` → `OrderDesk.add_product(...)`。参数名见 `core.py` 的公开方法签名。新建商品默认处于销售状态。
+- `set-product-enabled` → `OrderDesk.set_product_enabled(sku, enabled)`。暂停或恢复商品销售。`sku` 去除首尾空白后匹配并区分大小写；非字符串、空白值或未知商品均抛出 `ValueError`。`enabled` 必须是布尔值，整数、字符串等不转换，否则抛出 `ValueError`。成功返回仅含 `sku`、`name`、`price_cents`、`enabled` 的商品对象；重复设置为同一状态仍成功。只切换销售状态，不改变名称、价格、库存、已有订单与历史，也不追加订单事件；结果保存在 `root/data.json`，重新打开后一致。
+- `get-product` → `OrderDesk.get_product(sku)`。按 sku 查询商品，返回仅含 `sku`、`name`、`price_cents`、`enabled` 的对象。`sku` 规则同上，非字符串、空白值或未知商品抛出 `ValueError`。没有 `enabled` 字段的旧商品视为启用（返回 `true`），查询不补写字段、不创建目录或文件。
 - `restock` → `OrderDesk.restock(sku, quantity)`。补货只增加在库量，不改变预留量；商品首次成功补货后纳管库存。
 - `stock` → `OrderDesk.stock(sku)`。返回 `{sku, on_hand, reserved, available}`；未纳管商品的 `on_hand`、`available` 为 `null`，`reserved` 为 `0`。
-- `place` → `OrderDesk.place(...)`。对已纳管商品按合计数量检查并预留可用量（在库量减预留量），任一商品缺货则整笔订单不创建。
-- `amend` → `OrderDesk.amend(order_id, lines)`。替换 `placed` 订单的全部商品行，不另建订单，编号与状态不变。`lines` 结构同 `place`，行内额外字段忽略；商品行保留输入顺序与重复 SKU，单价取提交时商品目录，小计与总金额仍为整数分，`get` 与 `list` 返回修改后的内容。同一 SKU 合并数量检查：新需求不得超过当前可用量加该订单实际预留量；成功后各商品预留量等于其他订单预留加本次需求，在库量不变，移除的商品释放其原预留，此后取消或发货只处理修改后的实际预留。未纳管商品仍不限制数量、不生成预留；下单后才纳管的商品按当前库存检查并预留；无预留记录的旧订单不获得额外额度。订单不存在或非 `placed`、编号或 SKU 非法、清单非列表或为空、行非对象或缺少 `sku`/`quantity`、数量非正整数或为布尔值、商品未知、库存不足均抛出 `ValueError`，拒绝不改写数据、不消耗历史序号。每次成功提交（含相同清单重复提交）追加 `action` 为 `amend`、`result` 为修改后订单快照的历史事件，旧事件与 `complete` 不变，无历史的旧订单从 1 开始且 `complete` 为 `false`；修改与历史同次写入 `root/data.json`。
-- `quote` → `OrderDesk.quote(lines)`。下单前预览，不创建订单、不预留库存、不写任何文件。`lines` 为非空列表，每行含 `sku`（去除首尾空白后非空字符串，区分大小写）和正整数 `quantity`（不接受布尔值），行内额外字段忽略；清单非列表或为空、行不是对象、缺少必要字段、sku 非法、数量为零/负数/非整数、商品不存在均抛出 `ValueError`，整次预览不返回部分结果。相同 sku 合并数量，商品行按 sku 升序；返回仅含 `lines`、`total_cents`、`can_place`，每行仅含 `sku`、`quantity`、`unit_price_cents`、`subtotal_cents`、`available`、`shortfall`。单价只取当前目录，小计为合并数量乘单价，缺货商品和零价商品都保留。纳管商品 `available` 为在库量减预留量，`shortfall` 为需求超过可用量的部分（未超过为零）；未纳管商品（含无库存字段的旧数据）`available` 为 `null`、`shortfall` 为零。所有行缺口为零时 `can_place` 为 `true`。预览不锁定价格或库存，随后交给 `place` 时仍按当时数据校验和预留。
+- `place` → `OrderDesk.place(...)`。对已纳管商品按合计数量检查并预留可用量（在库量减预留量），任一商品缺货则整笔订单不创建。清单包含暂停销售商品（或任何未知商品）时整次抛出 `ValueError`，不创建订单、不预留库存。
+- `amend` → `OrderDesk.amend(order_id, lines)`。替换 `placed` 订单的全部商品行，不另建订单，编号与状态不变。`lines` 结构同 `place`，行内额外字段忽略；商品行保留输入顺序与重复 SKU，单价取提交时商品目录，小计与总金额仍为整数分，`get` 与 `list` 返回修改后的内容。同一 SKU 合并数量检查：新需求不得超过当前可用量加该订单实际预留量；成功后各商品预留量等于其他订单预留加本次需求，在库量不变，移除的商品释放其原预留，此后取消或发货只处理修改后的实际预留。未纳管商品仍不限制数量、不生成预留；下单后才纳管的商品按当前库存检查并预留；无预留记录的旧订单不获得额外额度。暂停销售商品只能保留（含重复行重排，如原两行合计三件可重排为三件）、减量或移除：不得加入原清单没有的暂停商品，新清单中该 SKU 合计数量不得增加（减为一件后不能再增至两件）；比较分别合并当前订单与新清单的重复 SKU，以当前订购量为准，不使用历史数量或实际预留量。允许的改单仍按当前目录计价并沿用既有库存校验、预留更新与历史记录语义。恢复启用后恢复既有规则。订单不存在或非 `placed`、编号或 SKU 非法、清单非列表或为空、行非对象或缺少 `sku`/`quantity`、数量非正整数或为布尔值、商品未知、库存不足或违反暂停商品改单限制均抛出 `ValueError`，拒绝不改写数据、不消耗历史序号。每次成功提交（含相同清单重复提交）追加 `action` 为 `amend`、`result` 为修改后订单快照的历史事件，旧事件与 `complete` 不变，无历史的旧订单从 1 开始且 `complete` 为 `false`；修改与历史同次写入 `root/data.json`。
+- `quote` → `OrderDesk.quote(lines)`。下单前预览，不创建订单、不预留库存、不写任何文件。`lines` 为非空列表，每行含 `sku`（去除首尾空白后非空字符串，区分大小写）和正整数 `quantity`（不接受布尔值），行内额外字段忽略；清单非列表或为空、行不是对象、缺少必要字段、sku 非法、数量为零/负数/非整数、商品不存在或清单包含暂停销售商品均抛出 `ValueError`，整次预览不返回部分结果。相同 sku 合并数量，商品行按 sku 升序；返回仅含 `lines`、`total_cents`、`can_place`，每行仅含 `sku`、`quantity`、`unit_price_cents`、`subtotal_cents`、`available`、`shortfall`。单价只取当前目录，小计为合并数量乘单价，缺货商品和零价商品都保留。纳管商品 `available` 为在库量减预留量，`shortfall` 为需求超过可用量的部分（未超过为零）；未纳管商品（含无库存字段的旧数据）`available` 为 `null`、`shortfall` 为零。所有行缺口为零时 `can_place` 为 `true`。预览不锁定价格或库存，随后交给 `place` 时仍按当时数据校验和预留。
 - `get` → `OrderDesk.get(...)`。参数名见 `core.py` 的公开方法签名。
 - `cancel` → `OrderDesk.cancel(...)`。取消只释放该订单实际预留的数量，在库量不变。
 - `ship` → `OrderDesk.ship(order_id, carrier, tracking_no)`。一次性整单发货：状态改为 `shipped`，订单新增仅含 `carrier`、`tracking_no`（均去除首尾空白）的 `shipment`。按该订单实际预留的数量同时扣减在库量与预留量，可用量不变；未纳管商品、下单后才纳管的商品及无预留记录的旧订单不扣库存。订单不存在、已取消或已发货均报错，重复发货不覆盖记录或再次扣减。
@@ -49,4 +51,4 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 
 ## 当前边界
 
-当前仅支持一币种、一个商品目录、一次性取消和发货、分次退货登记（不退款、不回补库存）、整笔退货入库（不退款、不分批入库）、按商品的库存预留及库存盘点登记。没有支付、拆单或物流联网功能。 不承诺并发写入或断电恢复。
+当前仅支持一币种、一个商品目录、商品暂停/恢复销售（只阻止新的 quote 与 place，补货、取消、发货、退货登记、退货入库、盘点及已有订单的改单继续适用）、一次性取消和发货、分次退货登记（不退款、不回补库存）、整笔退货入库（不退款、不分批入库）、按商品的库存预留及库存盘点登记。没有支付、拆单或物流联网功能。 不承诺并发写入或断电恢复。
