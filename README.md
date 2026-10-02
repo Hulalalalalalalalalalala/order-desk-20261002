@@ -27,6 +27,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `restock` → `OrderDesk.restock(sku, quantity)`。补货只增加在库量，不改变预留量；商品首次成功补货后纳管库存。
 - `stock` → `OrderDesk.stock(sku)`。返回 `{sku, on_hand, reserved, available}`；未纳管商品的 `on_hand`、`available` 为 `null`，`reserved` 为 `0`。
 - `place` → `OrderDesk.place(...)`。对已纳管商品按合计数量检查并预留可用量（在库量减预留量），任一商品缺货则整笔订单不创建。
+- `quote` → `OrderDesk.quote(lines)`。下单前预览，不创建订单、不预留库存、不写任何文件。`lines` 为非空列表，每行含 `sku`（去除首尾空白后非空字符串，区分大小写）和正整数 `quantity`（不接受布尔值），行内额外字段忽略；清单非列表或为空、行不是对象、缺少必要字段、sku 非法、数量为零/负数/非整数、商品不存在均抛出 `ValueError`，整次预览不返回部分结果。相同 sku 合并数量，商品行按 sku 升序；返回仅含 `lines`、`total_cents`、`can_place`，每行仅含 `sku`、`quantity`、`unit_price_cents`、`subtotal_cents`、`available`、`shortfall`。单价只取当前目录，小计为合并数量乘单价，缺货商品和零价商品都保留。纳管商品 `available` 为在库量减预留量，`shortfall` 为需求超过可用量的部分（未超过为零）；未纳管商品（含无库存字段的旧数据）`available` 为 `null`、`shortfall` 为零。所有行缺口为零时 `can_place` 为 `true`。预览不锁定价格或库存，随后交给 `place` 时仍按当时数据校验和预留。
 - `get` → `OrderDesk.get(...)`。参数名见 `core.py` 的公开方法签名。
 - `cancel` → `OrderDesk.cancel(...)`。取消只释放该订单实际预留的数量，在库量不变。
 - `ship` → `OrderDesk.ship(order_id, carrier, tracking_no)`。一次性整单发货：状态改为 `shipped`，订单新增仅含 `carrier`、`tracking_no`（均去除首尾空白）的 `shipment`。按该订单实际预留的数量同时扣减在库量与预留量，可用量不变；未纳管商品、下单后才纳管的商品及无预留记录的旧订单不扣库存。订单不存在、已取消或已发货均报错，重复发货不覆盖记录或再次扣减。
