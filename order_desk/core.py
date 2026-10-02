@@ -658,6 +658,100 @@ class OrderDesk(JsonStore):
             })
         return {"order_ids": sorted(selected), "lines": lines}
 
+    def reservation_plan(self, order_ids):
+        # Read-only priority preview of reservation top-ups: orders are previewed
+        # in the given order; an order whose new demand fits the remaining margin
+        # consumes that margin, a short order consumes nothing and later orders
+        # keep being evaluated. Existing reservations are never released or
+        # transferred; this never writes.
+        if not isinstance(order_ids, list) or not order_ids:
+            raise ValueError("order_ids must be a nonempty list")
+        selected = []
+        seen = set()
+        for order_id in order_ids:
+            order_id = text(order_id, "order_id")
+            if order_id in seen:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen.add(order_id)
+            selected.append(order_id)
+        data = self._read()
+        orders = data.get("orders", {})
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        all_reservations = data.get("reservations", {})
+        # Merge duplicate sku lines inside each order first; the whole query is
+        # rejected if any selected order is missing, no longer placed, or carries
+        # a product outside the current catalog.
+        demanded = {}  # order_id -> {sku: merged quantity}
+        for order_id in selected:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be reserved: " + order_id)
+            per_order = {}
+            for line in order["lines"]:
+                per_order[line["sku"]] = per_order.get(line["sku"], 0) + line["quantity"]
+            for sku in per_order:
+                if sku not in products:
+                    raise ValueError("unknown product: " + sku)
+            demanded[order_id] = per_order
+        # The margin starts at stock's current available per managed sku and is
+        # only reduced by earlier orders that could be completed.
+        remaining = {}
+        for sku, entry in inventory.items():
+            remaining[sku] = entry["on_hand"] - entry["reserved"]
+        results = []
+        for order_id in selected:
+            per_order = demanded[order_id]
+            own = all_reservations.get(order_id, {})
+            needs = {sku: max(0, qty - own.get(sku, 0)) for sku, qty in per_order.items()}
+            # Evaluate every managed sku before consuming anything: an order
+            # either covers all of its new demand or none of it.
+            fits = True
+            for sku in sorted(per_order):
+                if sku in inventory and needs[sku] > remaining.get(sku, 0):
+                    fits = False
+                    break
+            lines = []
+            for sku in sorted(per_order):
+                quantity = per_order[sku]
+                reserved = own.get(sku, 0)
+                demand = needs[sku]
+                if sku not in inventory:
+                    # Unmanaged products (including legacy data without inventory
+                    # records) never constrain demand and never consume margin.
+                    lines.append({
+                        "sku": sku,
+                        "quantity": quantity,
+                        "reserved": 0,
+                        "available": None,
+                        "shortfall": 0,
+                    })
+                    continue
+                available = remaining.get(sku, 0)
+                if fits:
+                    shortfall = 0
+                else:
+                    shortfall = max(0, demand - available)
+                lines.append({
+                    "sku": sku,
+                    "quantity": quantity,
+                    "reserved": reserved,
+                    "available": available,
+                    "shortfall": shortfall,
+                })
+            if fits:
+                for sku in per_order:
+                    if sku in inventory:
+                        remaining[sku] = remaining.get(sku, 0) - needs[sku]
+            results.append({
+                "order_id": order_id,
+                "can_reserve": fits,
+                "lines": lines,
+            })
+        return results
+
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
 
