@@ -14,6 +14,22 @@ class OrderDesk(JsonStore):
             "result": copy.deepcopy(result),
         })
 
+    def _record_stock_event(self, data, sku, action, reference_id, before, after, complete=False):
+        # Each sku counts its own stock events from 1; products managed before
+        # stock history existed start with complete=False the first time a new
+        # event is recorded, while the restock that first manages a product
+        # starts a complete history.
+        document = data.setdefault("stock_history", {}).setdefault(
+            sku, {"complete": complete, "events": []}
+        )
+        document["events"].append({
+            "sequence": len(document["events"]) + 1,
+            "action": action,
+            "reference_id": reference_id,
+            "before": copy.deepcopy(before),
+            "after": copy.deepcopy(after),
+        })
+
     def add_product(self, sku, name, price_cents):
         sku, name = text(sku, "sku"), text(name, "name")
         if type(price_cents) is not int or price_cents < 0:
@@ -69,8 +85,18 @@ class OrderDesk(JsonStore):
         if sku not in data.get("products", {}):
             raise ValueError("unknown product: " + sku)
         inventory = data.setdefault("inventory", {})
-        entry = inventory.setdefault(sku, {"on_hand": 0, "reserved": 0})
+        entry = inventory.get(sku)
+        if entry is None:
+            # First successful restock manages the product; the before
+            # snapshot is the unmanaged stock view and the history is complete.
+            before = {"sku": sku, "on_hand": None, "reserved": 0, "available": None}
+            entry = inventory[sku] = {"on_hand": 0, "reserved": 0}
+            complete = True
+        else:
+            before = self._stock_view(sku, entry)
+            complete = False
         entry["on_hand"] += quantity
+        self._record_stock_event(data, sku, "restock", None, before, self._stock_view(sku, entry), complete)
         self._write(data)
         return self._stock_view(sku, entry)
 
@@ -133,6 +159,12 @@ class OrderDesk(JsonStore):
             })
         for sku, on_hand in counts.items():
             inventory[sku]["on_hand"] = on_hand
+        for line in result_lines:
+            # A count that confirms the current on_hand is no stock change.
+            if line["delta"]:
+                self._record_stock_event(
+                    data, line["sku"], "count-stock", count_id, line["before"], line["after"]
+                )
         result = {"count_id": count_id, "lines": result_lines}
         data.setdefault("stock_counts", {})[count_id] = copy.deepcopy(result)
         self._write(data)
@@ -183,8 +215,11 @@ class OrderDesk(JsonStore):
             reservations[sku] = quantity
         if reservations:
             inventory = data.setdefault("inventory", {})
-            for sku, quantity in reservations.items():
-                inventory[sku]["reserved"] += quantity
+            for sku in sorted(reservations):
+                entry = inventory[sku]
+                before = self._stock_view(sku, entry)
+                entry["reserved"] += reservations[sku]
+                self._record_stock_event(data, sku, "place", order_id, before, self._stock_view(sku, entry))
             data.setdefault("reservations", {})[order_id] = reservations
         order = {"order_id": order_id, "status": "placed", "lines": items, "total_cents": sum(x["subtotal_cents"] for x in items)}
         data.setdefault("orders", {})[order_id] = order
@@ -291,7 +326,11 @@ class OrderDesk(JsonStore):
                 raise ValueError("insufficient stock: " + sku)
             reservations[sku] = quantity
         # Validate everything before touching inventory, so a rejected amend
-        # leaves stock, reservations and history untouched.
+        # leaves stock, reservations and history untouched. Stock history sees
+        # only the final net change per sku, never the temporary release and
+        # re-reservation below.
+        affected = sorted(sku for sku in set(own) | set(reservations) if inventory.get(sku) is not None)
+        before_views = {sku: self._stock_view(sku, inventory[sku]) for sku in affected}
         for sku, quantity in own.items():
             entry = inventory.get(sku)
             if entry is not None:
@@ -302,6 +341,10 @@ class OrderDesk(JsonStore):
             data.setdefault("reservations", {})[order_id] = reservations
         else:
             data.get("reservations", {}).pop(order_id, None)
+        for sku in affected:
+            after = self._stock_view(sku, inventory[sku])
+            if after != before_views[sku]:
+                self._record_stock_event(data, sku, "amend", order_id, before_views[sku], after)
         order["lines"] = items
         order["total_cents"] = sum(x["subtotal_cents"] for x in items)
         self._record_event(data, order_id, "amend", order, False)
@@ -370,10 +413,12 @@ class OrderDesk(JsonStore):
         reservations = data.get("reservations", {}).pop(order_id, None)
         if reservations:
             inventory = data.get("inventory", {})
-            for sku, quantity in reservations.items():
+            for sku in sorted(reservations):
                 entry = inventory.get(sku)
                 if entry is not None:
-                    entry["reserved"] -= quantity
+                    before = self._stock_view(sku, entry)
+                    entry["reserved"] -= reservations[sku]
+                    self._record_stock_event(data, sku, "cancel", order_id, before, self._stock_view(sku, entry))
         order["status"] = "cancelled"
         self._record_event(data, order_id, "cancel", order, False)
         self._write(data)
@@ -388,11 +433,13 @@ class OrderDesk(JsonStore):
         reservations = data.get("reservations", {}).pop(order_id, None)
         if reservations:
             inventory = data.get("inventory", {})
-            for sku, quantity in reservations.items():
+            for sku in sorted(reservations):
                 entry = inventory.get(sku)
                 if entry is not None:
-                    entry["on_hand"] -= quantity
-                    entry["reserved"] -= quantity
+                    before = self._stock_view(sku, entry)
+                    entry["on_hand"] -= reservations[sku]
+                    entry["reserved"] -= reservations[sku]
+                    self._record_stock_event(data, sku, "ship", order_id, before, self._stock_view(sku, entry))
         order["status"] = "shipped"
         order["shipment"] = {"carrier": carrier, "tracking_no": tracking_no}
         self._record_event(data, order_id, "ship", order, False)
@@ -678,6 +725,9 @@ class OrderDesk(JsonStore):
             result_lines.append({"sku": sku, "quantity": quantity, "before": before, "after": after})
         for line in result_lines:
             inventory[line["sku"]]["on_hand"] += line["quantity"]
+            self._record_stock_event(
+                data, line["sku"], "receive-return", return_id, line["before"], line["after"]
+            )
         result = {"order_id": order_id, "return_id": return_id, "lines": result_lines}
         data.setdefault("return_receipts", {})[return_id] = copy.deepcopy(result)
         self._record_event(data, order_id, "receive-return", result, False)
@@ -779,6 +829,24 @@ class OrderDesk(JsonStore):
         return {
             "order_id": order_id,
             "status": order["status"],
+            "complete": document["complete"],
+            "events": copy.deepcopy(document["events"]),
+        }
+
+    def stock_history(self, sku):
+        sku = text(sku, "sku")
+        data = self._read()
+        if sku not in data.get("products", {}):
+            raise ValueError("unknown product: " + sku)
+        document = data.get("stock_history", {}).get(sku)
+        if document is None:
+            # A product with no stock events is either still unmanaged (its
+            # empty history is complete) or was managed before stock history
+            # existed (its past changes are unrecoverable and never refilled).
+            managed = sku in data.get("inventory", {})
+            return {"sku": sku, "complete": not managed, "events": []}
+        return {
+            "sku": sku,
             "complete": document["complete"],
             "events": copy.deepcopy(document["events"]),
         }
