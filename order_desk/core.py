@@ -691,6 +691,80 @@ class OrderDesk(JsonStore):
             raise ValueError("return has not been received: " + return_id)
         return copy.deepcopy(receipt)
 
+    def return_worklist(self, stage="pending", order_id=None):
+        # Read-only cross-order worklist: active registrations read as pending
+        # unless they hold a receipt (received), cancelled registrations read as
+        # cancelled but stay visible. It never writes, never fabricates
+        # registrations from history, and treats missing receipts or cancellation
+        # buckets simply as absent.
+        if not isinstance(stage, str):
+            raise ValueError("stage must be one of: pending, received, cancelled, all")
+        stage = stage.strip()
+        if stage not in ("pending", "received", "cancelled", "all"):
+            raise ValueError("stage must be one of: pending, received, cancelled, all")
+        if order_id is not None:
+            order_id = text(order_id, "order_id")
+        data = self._read()
+        orders = data.get("orders", {})
+        if order_id is not None and order_id not in orders:
+            raise ValueError("unknown order: " + order_id)
+        receipts = data.get("return_receipts", {})
+        # Collect (record, record_stage) pairs in scope. Active records come
+        # first, cancelled ones after; the final result is sorted by return_id.
+        scoped = []
+        for bucket, is_cancelled in (
+            (data.get("returns", {}), False),
+            (data.get("cancelled_returns", {}), True),
+        ):
+            keys = (order_id,) if order_id is not None else sorted(bucket)
+            for key in keys:
+                for record in bucket.get(key, ()):
+                    if is_cancelled:
+                        record_stage = "cancelled"
+                    elif record["return_id"] in receipts:
+                        record_stage = "received"
+                    else:
+                        record_stage = "pending"
+                    if stage == "all" or record_stage == stage:
+                        scoped.append((record, record_stage))
+        # Every registration the worklist would actually contain must still
+        # belong to an existing shipped order; validate before building any view
+        # so one bad legacy record rejects the whole query instead of surfacing
+        # partial results.
+        for record, _ in scoped:
+            order = orders.get(record["order_id"])
+            if order is None:
+                raise ValueError("unknown order: " + record["order_id"])
+            if order["status"] != "shipped":
+                raise ValueError("only a shipped order can be on the return worklist: " + record["order_id"])
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        entries = []
+        for record, record_stage in scoped:
+            quantities = {}
+            for line in record["lines"]:
+                quantities[line["sku"]] = quantities.get(line["sku"], 0) + line["quantity"]
+            lines = [{"sku": sku, "quantity": quantities[sku]} for sku in sorted(quantities)]
+            blockers = []
+            if record_stage == "pending":
+                # Only pending entries are checked against the current catalog
+                # and inventory; paused sales never block receiving.
+                for sku in sorted(quantities):
+                    if sku not in products:
+                        blockers.append({"sku": sku, "reason": "unknown-product"})
+                    elif sku not in inventory:
+                        blockers.append({"sku": sku, "reason": "unmanaged"})
+            entries.append({
+                "order_id": record["order_id"],
+                "return_id": record["return_id"],
+                "stage": record_stage,
+                "lines": lines,
+                "can_receive": record_stage == "pending" and not blockers,
+                "blockers": blockers,
+            })
+        entries.sort(key=lambda item: item["return_id"])
+        return entries
+
     def history(self, order_id):
         order_id = text(order_id, "order_id")
         data = self._read()
