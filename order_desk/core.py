@@ -379,6 +379,24 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def _ship_order(self, data, order, carrier, tracking_no):
+        # Shared mutation for ship and ship_batch: the caller has already
+        # validated that the order is placed. Deducts only this order's actual
+        # reservations, marks it shipped and appends the ship event; the caller
+        # is responsible for writing `data`.
+        order_id = order["order_id"]
+        reservations = data.get("reservations", {}).pop(order_id, None)
+        if reservations:
+            inventory = data.get("inventory", {})
+            for sku, quantity in reservations.items():
+                entry = inventory.get(sku)
+                if entry is not None:
+                    entry["on_hand"] -= quantity
+                    entry["reserved"] -= quantity
+        order["status"] = "shipped"
+        order["shipment"] = {"carrier": carrier, "tracking_no": tracking_no}
+        self._record_event(data, order_id, "ship", order, False)
+
     def ship(self, order_id, carrier, tracking_no):
         order_id = text(order_id, "order_id")
         carrier = text(carrier, "carrier")
@@ -393,19 +411,43 @@ class OrderDesk(JsonStore):
             raise ValueError("order already shipped")
         if order["status"] != "placed":
             raise ValueError("only a placed order can be shipped")
-        reservations = data.get("reservations", {}).pop(order_id, None)
-        if reservations:
-            inventory = data.get("inventory", {})
-            for sku, quantity in reservations.items():
-                entry = inventory.get(sku)
-                if entry is not None:
-                    entry["on_hand"] -= quantity
-                    entry["reserved"] -= quantity
-        order["status"] = "shipped"
-        order["shipment"] = {"carrier": carrier, "tracking_no": tracking_no}
-        self._record_event(data, order_id, "ship", order, False)
+        self._ship_order(data, order, carrier, tracking_no)
         self._write(data)
         return order
+
+    def ship_batch(self, shipments):
+        # All-or-nothing batch shipment: every entry is normalized and every
+        # referenced order is checked before any mutation, so a rejected batch
+        # leaves orders, stock, reservations and history byte-for-byte untouched
+        # and never creates the data directory.
+        if not isinstance(shipments, list) or not shipments:
+            raise ValueError("shipments must be a nonempty list")
+        entries = []
+        seen = set()
+        for item in shipments:
+            if not isinstance(item, dict):
+                raise ValueError("each shipment must be an object with order_id, carrier and tracking_no")
+            order_id = text(item.get("order_id"), "order_id")
+            carrier = text(item.get("carrier"), "carrier")
+            tracking_no = text(item.get("tracking_no"), "tracking_no")
+            if order_id in seen:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen.add(order_id)
+            entries.append((order_id, carrier, tracking_no))
+        data = self._read()
+        orders = data.get("orders", {})
+        planned = []
+        for order_id, carrier, tracking_no in entries:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be shipped: " + order_id)
+            planned.append((order, carrier, tracking_no))
+        for order, carrier, tracking_no in planned:
+            self._ship_order(data, order, carrier, tracking_no)
+        self._write(data)
+        return sorted((order for order, _, _ in planned), key=lambda x: x["order_id"])
 
     def pick_list(self, order_ids):
         # Read-only picking summary across the selected placed orders: it merges
