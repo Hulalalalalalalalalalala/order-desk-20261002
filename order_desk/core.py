@@ -147,6 +147,68 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def amend(self, order_id, lines):
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        items = []
+        needed = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            items.append((sku, quantity))
+            needed[sku] = needed.get(sku, 0) + quantity
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] != "placed":
+            raise ValueError("only a placed order can be amended")
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        old_res = data.get("reservations", {}).get(order_id, {})
+        # Validate the whole replacement against current data before touching
+        # anything, so a rejected amendment leaves order, stock and history as
+        # they were. The order may reuse its own reservation: its new demand
+        # only has to fit on_hand minus other orders' reservations.
+        for sku, quantity in needed.items():
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            entry = inventory.get(sku)
+            if entry is None:
+                # Unmanaged goods stay unrestricted and create no reservation.
+                continue
+            mine = old_res.get(sku, 0)
+            if quantity > entry["on_hand"] - entry["reserved"] + mine:
+                raise ValueError("insufficient stock: " + sku)
+        new_lines = []
+        for sku, quantity in items:
+            unit_price = products[sku]["price_cents"]
+            new_lines.append({
+                "sku": sku,
+                "quantity": quantity,
+                "unit_price_cents": unit_price,
+                "subtotal_cents": quantity * unit_price,
+            })
+        new_res = {}
+        for sku in set(old_res) | set(needed):
+            entry = inventory.get(sku)
+            old_qty = old_res.get(sku, 0)
+            new_qty = needed.get(sku, 0) if entry is not None else 0
+            if entry is not None:
+                entry["reserved"] += new_qty - old_qty
+            if new_qty:
+                new_res[sku] = new_qty
+        if new_res:
+            data.setdefault("reservations", {})[order_id] = new_res
+        else:
+            data.setdefault("reservations", {}).pop(order_id, None)
+        order["lines"] = new_lines
+        order["total_cents"] = sum(line["subtotal_cents"] for line in new_lines)
+        self._record_event(data, order_id, "amend", order, False)
+        self._write(data)
+        return order
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
