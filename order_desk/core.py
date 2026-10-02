@@ -14,6 +14,31 @@ class OrderDesk(JsonStore):
             "result": copy.deepcopy(result),
         })
 
+    @staticmethod
+    def _unmanaged_stock_view(sku):
+        # Mirrors stock() for a product that has never been restocked.
+        return {"sku": sku, "on_hand": None, "reserved": 0, "available": None}
+
+    def _record_stock_event(self, data, sku, action, reference_id, before, after):
+        # One event stream per product. Events are only appended by operations
+        # that actually changed on_hand or reserved, and the whole operation is
+        # validated before the helper runs, so a rejected call never reaches
+        # here and never consumes a sequence. A product that is already managed
+        # but has no stock_history document is legacy data: its stream starts
+        # incomplete and stays incomplete forever.
+        documents = data.setdefault("stock_history", {})
+        document = documents.get(sku)
+        if document is None:
+            document = {"complete": before["on_hand"] is None, "events": []}
+            documents[sku] = document
+        document["events"].append({
+            "sequence": len(document["events"]) + 1,
+            "action": action,
+            "reference_id": reference_id,
+            "before": copy.deepcopy(before),
+            "after": copy.deepcopy(after),
+        })
+
     def add_product(self, sku, name, price_cents):
         sku, name = text(sku, "sku"), text(name, "name")
         if type(price_cents) is not int or price_cents < 0:
@@ -69,10 +94,17 @@ class OrderDesk(JsonStore):
         if sku not in data.get("products", {}):
             raise ValueError("unknown product: " + sku)
         inventory = data.setdefault("inventory", {})
+        existed = sku in inventory
+        if existed:
+            before = self._stock_view(sku, inventory[sku])
+        else:
+            before = self._unmanaged_stock_view(sku)
         entry = inventory.setdefault(sku, {"on_hand": 0, "reserved": 0})
         entry["on_hand"] += quantity
+        after = self._stock_view(sku, entry)
+        self._record_stock_event(data, sku, "restock", None, before, after)
         self._write(data)
-        return self._stock_view(sku, entry)
+        return after
 
     def stock(self, sku):
         sku = text(sku, "sku")
@@ -89,6 +121,27 @@ class OrderDesk(JsonStore):
         on_hand = entry["on_hand"]
         reserved = entry["reserved"]
         return {"sku": sku, "on_hand": on_hand, "reserved": reserved, "available": on_hand - reserved}
+
+    def stock_history(self, sku):
+        sku = text(sku, "sku")
+        data = self._read()
+        if sku not in data.get("products", {}):
+            raise ValueError("unknown product: " + sku)
+        # Read-only: never fabricate events from orders or stock counts, and
+        # never fill in a missing history document.
+        if sku not in data.get("inventory", {}):
+            return {"sku": sku, "complete": True, "events": []}
+        document = data.get("stock_history", {}).get(sku)
+        if document is None:
+            # Managed product (inventory entry exists) with no recorded stream:
+            # legacy data predating stock history. It starts at 1 with
+            # complete=False and can never become complete.
+            return {"sku": sku, "complete": False, "events": []}
+        return {
+            "sku": sku,
+            "complete": document["complete"],
+            "events": copy.deepcopy(document["events"]),
+        }
 
     def count_stock(self, count_id, lines):
         count_id = text(count_id, "count_id")
@@ -133,6 +186,15 @@ class OrderDesk(JsonStore):
             })
         for sku, on_hand in counts.items():
             inventory[sku]["on_hand"] = on_hand
+        # Only lines whose on_hand actually moved leave stock events; an
+        # equal-value count changes nothing. All lines were validated before
+        # any mutation, so a rejected count never reaches this point.
+        for line in result_lines:
+            if line["delta"] != 0:
+                self._record_stock_event(
+                    data, line["sku"], "count-stock", count_id,
+                    line["before"], line["after"],
+                )
         result = {"count_id": count_id, "lines": result_lines}
         data.setdefault("stock_counts", {})[count_id] = copy.deepcopy(result)
         self._write(data)
@@ -183,8 +245,14 @@ class OrderDesk(JsonStore):
             reservations[sku] = quantity
         if reservations:
             inventory = data.setdefault("inventory", {})
+            before_views = {sku: self._stock_view(sku, inventory[sku]) for sku in reservations}
             for sku, quantity in reservations.items():
                 inventory[sku]["reserved"] += quantity
+            for sku in sorted(reservations):
+                self._record_stock_event(
+                    data, sku, "place", order_id,
+                    before_views[sku], self._stock_view(sku, inventory[sku]),
+                )
             data.setdefault("reservations", {})[order_id] = reservations
         order = {"order_id": order_id, "status": "placed", "lines": items, "total_cents": sum(x["subtotal_cents"] for x in items)}
         data.setdefault("orders", {})[order_id] = order
@@ -291,14 +359,33 @@ class OrderDesk(JsonStore):
                 raise ValueError("insufficient stock: " + sku)
             reservations[sku] = quantity
         # Validate everything before touching inventory, so a rejected amend
-        # leaves stock, reservations and history untouched.
+        # leaves stock, reservations and history untouched. Compute final net
+        # reservation changes per sku and apply them directly: temporary
+        # releases and re-reservations are never recorded, and skus with zero
+        # net change leave no stock event.
+        deltas = {}
         for sku, quantity in own.items():
+            deltas[sku] = deltas.get(sku, 0) - quantity
+        for sku, quantity in reservations.items():
+            deltas[sku] = deltas.get(sku, 0) + quantity
+        changed = {sku: delta for sku, delta in deltas.items() if delta != 0}
+        before_views = {}
+        for sku in changed:
             entry = inventory.get(sku)
             if entry is not None:
-                entry["reserved"] -= quantity
+                before_views[sku] = self._stock_view(sku, entry)
+        for sku, delta in changed.items():
+            entry = inventory.get(sku)
+            if entry is not None:
+                entry["reserved"] += delta
+        for sku in sorted(changed):
+            entry = inventory.get(sku)
+            if entry is not None:
+                self._record_stock_event(
+                    data, sku, "amend", order_id,
+                    before_views[sku], self._stock_view(sku, entry),
+                )
         if reservations:
-            for sku, quantity in reservations.items():
-                inventory[sku]["reserved"] += quantity
             data.setdefault("reservations", {})[order_id] = reservations
         else:
             data.get("reservations", {}).pop(order_id, None)
@@ -370,10 +457,21 @@ class OrderDesk(JsonStore):
         reservations = data.get("reservations", {}).pop(order_id, None)
         if reservations:
             inventory = data.get("inventory", {})
+            before_views = {}
+            for sku in reservations:
+                entry = inventory.get(sku)
+                if entry is not None:
+                    before_views[sku] = self._stock_view(sku, entry)
             for sku, quantity in reservations.items():
                 entry = inventory.get(sku)
                 if entry is not None:
                     entry["reserved"] -= quantity
+            for sku in sorted(reservations):
+                if sku in before_views:
+                    self._record_stock_event(
+                        data, sku, "cancel", order_id,
+                        before_views[sku], self._stock_view(sku, inventory[sku]),
+                    )
         order["status"] = "cancelled"
         self._record_event(data, order_id, "cancel", order, False)
         self._write(data)
@@ -388,11 +486,24 @@ class OrderDesk(JsonStore):
         reservations = data.get("reservations", {}).pop(order_id, None)
         if reservations:
             inventory = data.get("inventory", {})
+            before_views = {}
+            for sku in reservations:
+                entry = inventory.get(sku)
+                if entry is not None:
+                    before_views[sku] = self._stock_view(sku, entry)
             for sku, quantity in reservations.items():
                 entry = inventory.get(sku)
                 if entry is not None:
                     entry["on_hand"] -= quantity
                     entry["reserved"] -= quantity
+            # Per-sku events; in a batch the orders are processed in request
+            # order, so snapshots for a shared sku chain across orders.
+            for sku in sorted(reservations):
+                if sku in before_views:
+                    self._record_stock_event(
+                        data, sku, "ship", order_id,
+                        before_views[sku], self._stock_view(sku, inventory[sku]),
+                    )
         order["status"] = "shipped"
         order["shipment"] = {"carrier": carrier, "tracking_no": tracking_no}
         self._record_event(data, order_id, "ship", order, False)
@@ -678,6 +789,11 @@ class OrderDesk(JsonStore):
             result_lines.append({"sku": sku, "quantity": quantity, "before": before, "after": after})
         for line in result_lines:
             inventory[line["sku"]]["on_hand"] += line["quantity"]
+        for line in result_lines:
+            self._record_stock_event(
+                data, line["sku"], "receive-return", return_id,
+                line["before"], line["after"],
+            )
         result = {"order_id": order_id, "return_id": return_id, "lines": result_lines}
         data.setdefault("return_receipts", {})[return_id] = copy.deepcopy(result)
         self._record_event(data, order_id, "receive-return", result, False)
