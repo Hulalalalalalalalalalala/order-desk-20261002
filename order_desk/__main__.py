@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import OrderDesk
 
-ACTIONS = {'add-product': 'add_product', 'restock': 'restock', 'stock': 'stock', 'place': 'place', 'quote': 'quote', 'get': 'get', 'cancel': 'cancel', 'ship': 'ship', 'list': 'list_orders', 'record-return': 'record_return', 'returns': 'get_returns', 'history': 'history'}
+ACTIONS = {'add-product': 'add_product', 'restock': 'restock', 'stock': 'stock', 'count-stock': 'count_stock', 'stock-count': 'get_stock_count', 'place': 'place', 'quote': 'quote', 'get': 'get', 'cancel': 'cancel', 'ship': 'ship', 'list': 'list_orders', 'record-return': 'record_return', 'returns': 'get_returns', 'history': 'history'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))

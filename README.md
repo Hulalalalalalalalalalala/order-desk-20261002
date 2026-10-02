@@ -26,6 +26,8 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `add-product` → `OrderDesk.add_product(...)`。参数名见 `core.py` 的公开方法签名。
 - `restock` → `OrderDesk.restock(sku, quantity)`。补货只增加在库量，不改变预留量；商品首次成功补货后纳管库存。
 - `stock` → `OrderDesk.stock(sku)`。返回 `{sku, on_hand, reserved, available}`；未纳管商品的 `on_hand`、`available` 为 `null`，`reserved` 为 `0`。
+- `count-stock` → `OrderDesk.count_stock(count_id, lines)`。用实际清点数量校准已纳管商品的在库量。`count_id` 去除首尾空白后须为非空字符串（区分大小写），在 root 内唯一，重复编号（即使内容相同）拒绝且不覆盖；`lines` 为非空列表，每行含 `sku`（去除首尾空白后非空字符串，区分大小写）和非负整数 `on_hand`（含零，布尔值不接受），行内额外字段忽略。同一次盘点出现重复 sku 直接拒绝，不合并数量。商品必须已存在且已纳管（首次成功补货后纳管），且新在库量不得低于当前预留量，否则整次盘点拒绝。成功后一次性替换本次全部商品的在库量，保留预留量及各订单实际预留记录，未列出的商品不变。返回仅含 `count_id`、`lines`，商品行按 sku 升序，每行仅含 `sku`、`before`、`after`、`delta`；`before` 与 `after` 均沿用 stock 的完整库存结构（`{sku, on_hand, reserved, available}`，分别为盘点前与盘点后的快照），`delta` 为盘点后在库量减盘点前在库量（可为负）。非法编号、非法清单或商品行、缺少字段、非法数量、未知或未纳管商品、重复 sku、低于预留量及重复编号均抛出 `ValueError`，整次操作不改变数据文件，也不保存部分结果。
+- `stock-count` → `OrderDesk.get_stock_count(count_id)`。返回登记时保存的盘点快照（结构同 count-stock 的返回），后续补货、下单、取消、发货或再次盘点均不改写快照。`count_id` 须为去除首尾空白后的非空字符串；非法或不存在的编号均抛出 `ValueError`，查询不创建目录或写文件。
 - `place` → `OrderDesk.place(...)`。对已纳管商品按合计数量检查并预留可用量（在库量减预留量），任一商品缺货则整笔订单不创建。
 - `quote` → `OrderDesk.quote(lines)`。下单前预览，不创建订单、不预留库存、不写任何文件。`lines` 为非空列表，每行含 `sku`（去除首尾空白后非空字符串，区分大小写）和正整数 `quantity`（不接受布尔值），行内额外字段忽略；清单非列表或为空、行不是对象、缺少必要字段、sku 非法、数量为零/负数/非整数、商品不存在均抛出 `ValueError`，整次预览不返回部分结果。相同 sku 合并数量，商品行按 sku 升序；返回仅含 `lines`、`total_cents`、`can_place`，每行仅含 `sku`、`quantity`、`unit_price_cents`、`subtotal_cents`、`available`、`shortfall`。单价只取当前目录，小计为合并数量乘单价，缺货商品和零价商品都保留。纳管商品 `available` 为在库量减预留量，`shortfall` 为需求超过可用量的部分（未超过为零）；未纳管商品（含无库存字段的旧数据）`available` 为 `null`、`shortfall` 为零。所有行缺口为零时 `can_place` 为 `true`。预览不锁定价格或库存，随后交给 `place` 时仍按当时数据校验和预留。
 - `get` → `OrderDesk.get(...)`。参数名见 `core.py` 的公开方法签名。
@@ -44,4 +46,4 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 
 ## 当前边界
 
-当前仅支持一币种、一个商品目录、一次性取消和发货、分次退货登记（不退款、不回补库存）及按商品的库存预留。没有支付、拆单或物流联网功能。 不承诺并发写入或断电恢复。
+当前仅支持一币种、一个商品目录、一次性取消和发货、分次退货登记（不退款、不回补库存）、库存盘点登记及按商品的库存预留。没有支付、拆单或物流联网功能。 不承诺并发写入或断电恢复。

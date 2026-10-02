@@ -55,6 +55,62 @@ class OrderDesk(JsonStore):
         reserved = entry["reserved"]
         return {"sku": sku, "on_hand": on_hand, "reserved": reserved, "available": on_hand - reserved}
 
+    def count_stock(self, count_id, lines):
+        count_id = text(count_id, "count_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        counts = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and on_hand")
+            sku = text(line.get("sku"), "sku")
+            on_hand = line.get("on_hand")
+            if type(on_hand) is not int or on_hand < 0:
+                raise ValueError("on_hand must be a nonnegative integer")
+            if sku in counts:
+                raise ValueError("duplicate sku: " + sku)
+            counts[sku] = on_hand
+        data = self._read()
+        if count_id in data.get("stock_counts", {}):
+            raise ValueError("stock count already exists: " + count_id)
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        planned = []
+        for sku in sorted(counts):
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            entry = inventory.get(sku)
+            if entry is None:
+                raise ValueError("product is not stock-managed: " + sku)
+            on_hand = counts[sku]
+            if on_hand < entry["reserved"]:
+                raise ValueError("counted quantity below reserved quantity: " + sku)
+            planned.append((sku, on_hand, self._stock_view(sku, entry)))
+        # Every line is valid: replace on_hand values and snapshot in one write.
+        result_lines = []
+        for sku, on_hand, before in planned:
+            inventory[sku]["on_hand"] = on_hand
+        for sku, on_hand, before in planned:
+            after = self._stock_view(sku, inventory[sku])
+            result_lines.append({
+                "sku": sku,
+                "before": before,
+                "after": after,
+                "delta": after["on_hand"] - before["on_hand"],
+            })
+        result = {"count_id": count_id, "lines": result_lines}
+        data.setdefault("stock_counts", {})[count_id] = copy.deepcopy(result)
+        self._write(data)
+        return result
+
+    def get_stock_count(self, count_id):
+        count_id = text(count_id, "count_id")
+        try:
+            record = self._read()["stock_counts"][count_id]
+        except KeyError:
+            raise ValueError("unknown stock count: " + count_id) from None
+        return copy.deepcopy(record)
+
     def place(self, order_id, lines):
         order_id = text(order_id, "order_id")
         if not isinstance(lines, list) or not lines:
