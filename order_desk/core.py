@@ -351,6 +351,73 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def reserve_order(self, order_id):
+        # Fill missing reservations for a placed order against current stock
+        # while preserving the deal: lines, prices, amounts and status never
+        # change. Managed products gain the nonnegative shortage between merged
+        # demand and this order's actual reservation; unmanaged products are
+        # unlimited but stay unreserved. All shortages must fit current
+        # availability or the whole fill is rejected. A fill with no new
+        # reservation still returns the snapshot but writes nothing.
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can reserve stock")
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        own = data.get("reservations", {}).get(order_id, {})
+        needed = {}
+        for line in order["lines"]:
+            needed[line["sku"]] = needed.get(line["sku"], 0) + line["quantity"]
+        added = {}
+        managed = set()
+        for sku, quantity in needed.items():
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            entry = inventory.get(sku)
+            if entry is None:
+                # Unmanaged at fill time: never auto-managed, stays at zero.
+                continue
+            managed.add(sku)
+            shortage = max(0, quantity - own.get(sku, 0))
+            if shortage > 0 and shortage > entry["on_hand"] - entry["reserved"]:
+                raise ValueError("insufficient stock: " + sku)
+            if shortage > 0:
+                added[sku] = shortage
+        result_lines = []
+        for sku in sorted(needed):
+            if sku in managed:
+                reserved = own.get(sku, 0) + added.get(sku, 0)
+            else:
+                reserved = 0
+            result_lines.append({
+                "sku": sku,
+                "quantity": needed[sku],
+                "added": added.get(sku, 0),
+                "reserved": reserved,
+            })
+        result = {"order_id": order_id, "lines": result_lines}
+        if not added:
+            # Nothing to fill (fully reserved already or all lines unmanaged):
+            # no file write, no order event and no stock events.
+            return result
+        # Validate everything before touching inventory, so a rejected fill
+        # leaves stock, reservations and history untouched.
+        inventory = data.setdefault("inventory", {})
+        reservations = data.setdefault("reservations", {}).setdefault(order_id, {})
+        for sku in sorted(added):
+            entry = inventory[sku]
+            before = self._stock_view(sku, entry)
+            entry["reserved"] += added[sku]
+            reservations[sku] = own.get(sku, 0) + added[sku]
+            self._record_stock_event(data, sku, "reserve-order", order_id, before, self._stock_view(sku, entry))
+        self._record_event(data, order_id, "reserve-order", result, False)
+        self._write(data)
+        return result
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
