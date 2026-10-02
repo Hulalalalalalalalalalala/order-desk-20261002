@@ -78,6 +78,63 @@ class OrderDesk(JsonStore):
         # Read-only: a missing enabled flag means enabled and is never filled in.
         return self._product_view(product)
 
+    def reprice_products(self, lines):
+        # All-or-nothing batch reprice: every line is normalized, every sku is
+        # checked against the catalog and every expected price against the
+        # current price before any product is touched, so a rejected batch
+        # leaves the file byte-for-byte untouched and never creates the data
+        # directory. Paused or unmanaged products may be repriced without
+        # resuming sales or managing stock; nothing but price_cents changes.
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = []
+        seen = set()
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku, expected_price_cents and price_cents")
+            sku = text(line.get("sku"), "sku")
+            expected_price = line.get("expected_price_cents")
+            target_price = line.get("price_cents")
+            for value, label in ((expected_price, "expected_price_cents"), (target_price, "price_cents")):
+                if type(value) is not int or value < 0:
+                    raise ValueError(label + " must be a nonnegative integer")
+            if sku in seen:
+                raise ValueError("duplicate sku in reprice: " + sku)
+            seen.add(sku)
+            requested.append((sku, expected_price, target_price))
+        data = self._read()
+        products = data.get("products", {})
+        # Verify every sku against the catalog and every expected price against
+        # the current price before mutating anything.
+        targets = {}
+        changed = False
+        for sku, expected_price, target_price in requested:
+            product = products.get(sku)
+            if product is None:
+                raise ValueError("unknown product: " + sku)
+            if expected_price != product["price_cents"]:
+                raise ValueError("expected price does not match current price: " + sku)
+            targets[sku] = (product, target_price)
+            if target_price != product["price_cents"]:
+                changed = True
+        # Build views from the catalog state: before from the current state,
+        # after from what the price will be once applied.
+        results = []
+        for sku in sorted(targets):
+            product, target_price = targets[sku]
+            before = self._product_view(product)
+            after = dict(before)
+            after["price_cents"] = target_price
+            results.append({"sku": sku, "before": before, "after": after})
+        if not changed:
+            # Every target equals the current price: still return the full
+            # result, but no file is written.
+            return results
+        for sku, (_, target_price) in targets.items():
+            products[sku]["price_cents"] = target_price
+        self._write(data)
+        return results
+
     def restock(self, sku, quantity):
         sku = text(sku, "sku")
         quantity = positive(quantity, "quantity")
