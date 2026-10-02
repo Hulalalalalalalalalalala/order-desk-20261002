@@ -147,6 +147,62 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def amend(self, order_id, lines):
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = []
+        needed = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested.append((sku, quantity))
+            needed[sku] = needed.get(sku, 0) + quantity
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can be amended")
+        products = data.get("products", {})
+        items = []
+        for sku, quantity in requested:
+            product = products.get(sku)
+            if product is None:
+                raise ValueError("unknown product: " + sku)
+            items.append({"sku": sku, "quantity": quantity, "unit_price_cents": product["price_cents"], "subtotal_cents": quantity * product["price_cents"]})
+        inventory = data.get("inventory", {})
+        own = data.get("reservations", {}).get(order_id, {})
+        # New demand may use what is available plus what this order already
+        # holds; orders without reservation records get no extra allowance.
+        reservations = {}
+        for sku, quantity in needed.items():
+            entry = inventory.get(sku)
+            if entry is None:
+                continue
+            if quantity > entry["on_hand"] - entry["reserved"] + own.get(sku, 0):
+                raise ValueError("insufficient stock: " + sku)
+            reservations[sku] = quantity
+        # Validate everything before touching inventory, so a rejected amend
+        # leaves stock, reservations and history untouched.
+        for sku, quantity in own.items():
+            entry = inventory.get(sku)
+            if entry is not None:
+                entry["reserved"] -= quantity
+        if reservations:
+            for sku, quantity in reservations.items():
+                inventory[sku]["reserved"] += quantity
+            data.setdefault("reservations", {})[order_id] = reservations
+        else:
+            data.get("reservations", {}).pop(order_id, None)
+        order["lines"] = items
+        order["total_cents"] = sum(x["subtotal_cents"] for x in items)
+        self._record_event(data, order_id, "amend", order, False)
+        self._write(data)
+        return order
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
