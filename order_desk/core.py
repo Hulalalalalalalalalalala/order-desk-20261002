@@ -365,6 +365,59 @@ class OrderDesk(JsonStore):
         remaining = [{"sku": sku, "quantity": ordered[sku] - returned.get(sku, 0)} for sku in sorted(ordered)]
         return {"order_id": order_id, "records": records, "remaining": remaining}
 
+    def _find_return(self, data, return_id):
+        for records in data.get("returns", {}).values():
+            for record in records:
+                if record["return_id"] == return_id:
+                    return record
+        return None
+
+    def receive_return(self, return_id):
+        return_id = text(return_id, "return_id")
+        data = self._read()
+        record = self._find_return(data, return_id)
+        if record is None:
+            raise ValueError("unknown return: " + return_id)
+        order_id = record["order_id"]
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] != "shipped":
+            raise ValueError("only a shipped order can receive a return: " + order_id)
+        if return_id in data.get("return_receipts", {}):
+            raise ValueError("return already received: " + return_id)
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        quantities = {}
+        for line in record["lines"]:
+            quantities[line["sku"]] = quantities.get(line["sku"], 0) + line["quantity"]
+        # Validate every product and build the snapshot before touching any
+        # inventory entry, so a rejected receive leaves stock untouched.
+        result_lines = []
+        for sku in sorted(quantities):
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            entry = inventory.get(sku)
+            if entry is None:
+                raise ValueError("product is not managed: " + sku)
+            quantity = quantities[sku]
+            before = self._stock_view(sku, entry)
+            on_hand = entry["on_hand"] + quantity
+            after = {"sku": sku, "on_hand": on_hand, "reserved": entry["reserved"], "available": on_hand - entry["reserved"]}
+            result_lines.append({"sku": sku, "quantity": quantity, "before": before, "after": after})
+        for line in result_lines:
+            inventory[line["sku"]]["on_hand"] += line["quantity"]
+        result = {"order_id": order_id, "return_id": return_id, "lines": result_lines}
+        data.setdefault("return_receipts", {})[return_id] = copy.deepcopy(result)
+        self._record_event(data, order_id, "receive-return", result, False)
+        self._write(data)
+        return result
+
+    def get_return_receipt(self, return_id):
+        return_id = text(return_id, "return_id")
+        receipt = self._read().get("return_receipts", {}).get(return_id)
+        if receipt is None:
+            raise ValueError("return has not been received: " + return_id)
+        return copy.deepcopy(receipt)
+
     def history(self, order_id):
         order_id = text(order_id, "order_id")
         data = self._read()
