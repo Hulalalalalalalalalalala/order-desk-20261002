@@ -414,6 +414,121 @@ class OrderDesk(JsonStore):
         self._write(data)
         return result
 
+    def reserve_batch(self, order_ids):
+        # Priority batch top-up: orders are processed in the given order
+        # (input order is the priority); an order whose new demand fits the
+        # remaining shared margin is topped up in full, an order that falls
+        # short on any managed sku is skipped whole and consumes nothing, and
+        # later orders keep being evaluated. Existing reservations are never
+        # released or transferred. Every order is validated before anything is
+        # planned or mutated, so a rejected batch leaves data, history and
+        # sequences untouched and never creates the data directory. When any
+        # order actually adds reservations, the whole batch (changes and
+        # history) is saved in one write; a batch with no additions writes
+        # nothing and appends no events.
+        if not isinstance(order_ids, list) or not order_ids:
+            raise ValueError("order_ids must be a nonempty list")
+        selected = []
+        seen = set()
+        for order_id in order_ids:
+            order_id = text(order_id, "order_id")
+            if order_id in seen:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen.add(order_id)
+            selected.append(order_id)
+        data = self._read()
+        orders = data.get("orders", {})
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        all_reservations = data.get("reservations", {})
+        # Merge duplicate sku lines inside each order first; the whole request
+        # is rejected if any selected order is missing, no longer placed, or
+        # carries a product outside the current catalog.
+        demanded = {}  # order_id -> {sku: merged quantity}
+        for order_id in selected:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be reserved: " + order_id)
+            per_order = {}
+            for line in order["lines"]:
+                per_order[line["sku"]] = per_order.get(line["sku"], 0) + line["quantity"]
+            for sku in per_order:
+                if sku not in products:
+                    raise ValueError("unknown product: " + sku)
+            demanded[order_id] = per_order
+        # The margin starts at stock's current available per managed sku and is
+        # only reduced by earlier orders that could be completed.
+        remaining = {}
+        for sku, entry in inventory.items():
+            remaining[sku] = entry["on_hand"] - entry["reserved"]
+        # Plan the whole batch against the shared margin before mutating: each
+        # order either covers all of its new demand or consumes nothing.
+        planned = []  # (order_id, additions, lines, can_reserve)
+        for order_id in selected:
+            per_order = demanded[order_id]
+            own = all_reservations.get(order_id, {})
+            needs = {sku: max(0, qty - own.get(sku, 0)) for sku, qty in per_order.items()}
+            fits = True
+            for sku in sorted(per_order):
+                if sku in inventory and needs[sku] > remaining.get(sku, 0):
+                    fits = False
+                    break
+            additions = {}
+            lines = []
+            for sku in sorted(per_order):
+                quantity = per_order[sku]
+                if sku not in inventory:
+                    # Unmanaged products (including legacy data without
+                    # inventory records) never constrain demand and are never
+                    # auto-managed.
+                    lines.append({"sku": sku, "quantity": quantity, "added": 0,
+                                  "reserved": 0, "shortfall": 0})
+                    continue
+                available = remaining.get(sku, 0)
+                added = needs[sku] if fits else 0
+                shortfall = 0 if fits else max(0, needs[sku] - available)
+                lines.append({
+                    "sku": sku,
+                    "quantity": quantity,
+                    "added": added,
+                    "reserved": own.get(sku, 0) + added,
+                    "shortfall": shortfall,
+                })
+                if fits and added:
+                    additions[sku] = added
+            if fits:
+                for sku, added in additions.items():
+                    remaining[sku] = remaining.get(sku, 0) - added
+            planned.append((order_id, additions, lines, fits))
+        results = []
+        any_additions = False
+        for order_id, additions, lines, fits in planned:
+            results.append({"order_id": order_id, "can_reserve": fits, "lines": lines})
+            if not additions:
+                continue
+            any_additions = True
+            # Stock events chain in request order across orders sharing a sku.
+            for sku in sorted(additions):
+                entry = inventory[sku]
+                before = self._stock_view(sku, entry)
+                entry["reserved"] += additions[sku]
+                self._record_stock_event(data, sku, "reserve-order", order_id, before, self._stock_view(sku, entry))
+            reservations = data.setdefault("reservations", {}).setdefault(order_id, {})
+            for sku, added in additions.items():
+                reservations[sku] = reservations.get(sku, 0) + added
+            # The order event keeps the single top-up result structure.
+            event_lines = [
+                {key: line[key] for key in ("sku", "quantity", "added", "reserved")}
+                for line in lines
+            ]
+            self._record_event(data, order_id, "reserve-order",
+                               {"order_id": order_id, "lines": event_lines}, False)
+        if any_additions:
+            self._write(data)
+        return results
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
