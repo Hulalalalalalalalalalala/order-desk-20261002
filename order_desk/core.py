@@ -351,6 +351,69 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def reserve_order(self, order_id):
+        # Top up reservations for a placed order whose products became managed
+        # after it was placed. Deal lines, prices, amounts and status are never
+        # touched, and paused sales never block the top-up.
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can be reserved")
+        needed = {}
+        for line in order["lines"]:
+            needed[line["sku"]] = needed.get(line["sku"], 0) + line["quantity"]
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        own = data.get("reservations", {}).get(order_id, {})
+        # Validate every sku and compute every addition against the current
+        # availability before touching any inventory entry, so a rejected
+        # top-up leaves stock, reservations and history untouched. A missing
+        # reservation record reads as zero.
+        additions = {}
+        for sku in sorted(needed):
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            entry = inventory.get(sku)
+            if entry is None:
+                # Unmanaged products stay unlimited and are never auto-managed.
+                continue
+            added = max(0, needed[sku] - own.get(sku, 0))
+            if added > entry["on_hand"] - entry["reserved"]:
+                raise ValueError("insufficient stock: " + sku)
+            if added:
+                additions[sku] = added
+        lines = []
+        for sku in sorted(needed):
+            if inventory.get(sku) is None:
+                lines.append({"sku": sku, "quantity": needed[sku], "added": 0, "reserved": 0})
+            else:
+                added = additions.get(sku, 0)
+                lines.append({
+                    "sku": sku,
+                    "quantity": needed[sku],
+                    "added": added,
+                    "reserved": own.get(sku, 0) + added,
+                })
+        result = {"order_id": order_id, "lines": lines}
+        if not additions:
+            # Nothing to add: the result is still returned, but no file is
+            # written and no events are appended.
+            return result
+        for sku in sorted(additions):
+            entry = inventory[sku]
+            before = self._stock_view(sku, entry)
+            entry["reserved"] += additions[sku]
+            self._record_stock_event(data, sku, "reserve-order", order_id, before, self._stock_view(sku, entry))
+        reservations = data.setdefault("reservations", {}).setdefault(order_id, {})
+        for sku, added in additions.items():
+            reservations[sku] = reservations.get(sku, 0) + added
+        self._record_event(data, order_id, "reserve-order", result, False)
+        self._write(data)
+        return result
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
