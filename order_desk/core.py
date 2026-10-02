@@ -429,10 +429,14 @@ class OrderDesk(JsonStore):
         if order["status"] != "shipped":
             raise ValueError("only a shipped order can accept returns")
         all_returns = data.get("returns", {})
-        for records in all_returns.values():
-            for record in records:
-                if record["return_id"] == return_id:
-                    raise ValueError("return already exists: " + return_id)
+        # Cancelled returns leave the active records but keep their id occupied
+        # for the whole root: a return_id can never be registered again, not
+        # even against a different order.
+        for bucket in (all_returns, data.get("cancelled_returns", {})):
+            for records in bucket.values():
+                for record in records:
+                    if record["return_id"] == return_id:
+                        raise ValueError("return already exists: " + return_id)
         ordered = {}
         for line in order["lines"]:
             ordered[line["sku"]] = ordered.get(line["sku"], 0) + line["quantity"]
@@ -472,20 +476,64 @@ class OrderDesk(JsonStore):
         remaining = [{"sku": sku, "quantity": ordered[sku] - returned.get(sku, 0)} for sku in sorted(ordered)]
         return {"order_id": order_id, "records": records, "remaining": remaining}
 
+    def cancel_return(self, return_id):
+        # Whole-registration cancellation only: it frees returnable quantity
+        # (the record stops counting in remaining) but never touches stock,
+        # reservations, order status, amounts, lines or shipment. The return_id
+        # stays occupied for the whole root.
+        return_id = text(return_id, "return_id")
+        data = self._read()
+        located = self._find_return(data, return_id)
+        if located is None:
+            raise ValueError("unknown return: " + return_id)
+        order_id, record, cancelled = located
+        if cancelled:
+            raise ValueError("return already cancelled: " + return_id)
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] != "shipped":
+            raise ValueError("only a shipped order can cancel a return: " + order_id)
+        if return_id in data.get("return_receipts", {}):
+            raise ValueError("return already received: " + return_id)
+        # Build the success snapshot before mutating; lines are already merged
+        # by sku and sorted from record_return, but copy only sku/quantity so
+        # the result never carries extra fields.
+        result = {
+            "order_id": order_id,
+            "return_id": return_id,
+            "lines": [{"sku": line["sku"], "quantity": line["quantity"]} for line in record["lines"]],
+        }
+        records = data["returns"][order_id]
+        records.remove(record)
+        if not records:
+            del data["returns"][order_id]
+        data.setdefault("cancelled_returns", {}).setdefault(order_id, []).append(copy.deepcopy(record))
+        self._record_event(data, order_id, "cancel-return", result, False)
+        self._write(data)
+        return result
+
     def _find_return(self, data, return_id):
+        # Returns (order_id, record, cancelled) for both active and cancelled
+        # registrations, so callers can tell an occupied-but-cancelled id from
+        # an unknown one.
         for records in data.get("returns", {}).values():
             for record in records:
                 if record["return_id"] == return_id:
-                    return record
+                    return record["order_id"], record, False
+        for records in data.get("cancelled_returns", {}).values():
+            for record in records:
+                if record["return_id"] == return_id:
+                    return record["order_id"], record, True
         return None
 
     def receive_return(self, return_id):
         return_id = text(return_id, "return_id")
         data = self._read()
-        record = self._find_return(data, return_id)
-        if record is None:
+        located = self._find_return(data, return_id)
+        if located is None:
             raise ValueError("unknown return: " + return_id)
-        order_id = record["order_id"]
+        order_id, record, cancelled = located
+        if cancelled:
+            raise ValueError("return already cancelled: " + return_id)
         order = data.get("orders", {}).get(order_id)
         if order is None or order["status"] != "shipped":
             raise ValueError("only a shipped order can receive a return: " + order_id)
