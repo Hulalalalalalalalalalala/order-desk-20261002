@@ -78,6 +78,61 @@ class OrderDesk(JsonStore):
         # Read-only: a missing enabled flag means enabled and is never filled in.
         return self._product_view(product)
 
+    def reprice_products(self, lines):
+        # Batch catalog price changes guarded by an expected-price check: the
+        # whole batch is validated against the current catalog before any price
+        # is touched, so a rejected request leaves products, orders, stock and
+        # history byte-for-byte untouched and never creates the data directory.
+        # Repricing never touches orders, carts, stock or history: existing
+        # deals keep their lines, prices, amounts and snapshots, while quote,
+        # new placements and cart checkouts read the new prices afterwards.
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku, expected_price_cents and price_cents")
+            sku = text(line.get("sku"), "sku")
+            expected = line.get("expected_price_cents")
+            target = line.get("price_cents")
+            if type(expected) is not int or expected < 0:
+                raise ValueError("expected_price_cents must be a nonnegative integer")
+            if type(target) is not int or target < 0:
+                raise ValueError("price_cents must be a nonnegative integer")
+            if sku in requested:
+                raise ValueError("duplicate sku in reprice: " + sku)
+            requested[sku] = (expected, target)
+        data = self._read()
+        products = data.get("products", {})
+        # Validate every line and build both views before touching any price,
+        # so a rejected batch leaves the catalog untouched. Paused and
+        # unmanaged products are repriced like any other; neither resumes
+        # sales nor becomes managed.
+        result_lines = []
+        changes = {}
+        for sku in sorted(requested):
+            product = products.get(sku)
+            if product is None:
+                raise ValueError("unknown product: " + sku)
+            expected, target = requested[sku]
+            if product["price_cents"] != expected:
+                raise ValueError("expected price does not match current price: " + sku)
+            before = self._product_view(product)
+            after = copy.deepcopy(before)
+            after["price_cents"] = target
+            if target != product["price_cents"]:
+                changes[sku] = target
+            result_lines.append({"sku": sku, "before": before, "after": after})
+        if not changes:
+            # Nothing actually changes: results are still returned, but no
+            # file is written and no history is appended.
+            return result_lines
+        for sku, target in changes.items():
+            # Only the price is stored; a missing enabled flag stays missing.
+            products[sku]["price_cents"] = target
+        self._write(data)
+        return result_lines
+
     def restock(self, sku, quantity):
         sku = text(sku, "sku")
         quantity = positive(quantity, "quantity")
