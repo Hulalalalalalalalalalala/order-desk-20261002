@@ -1196,6 +1196,40 @@ class OrderDesk(JsonStore):
     def receive_return(self, return_id):
         return_id = text(return_id, "return_id")
         data = self._read()
+        result = self._receive_return(data, return_id)
+        self._write(data)
+        return result
+
+    def receive_return_batch(self, return_ids):
+        # All-or-nothing batch receive: every id is normalized and every
+        # registration is received inside `data` before the single write, so a
+        # rejected batch leaves the file, stock, receipts, history and
+        # sequences untouched and never creates the data directory.
+        if not isinstance(return_ids, list) or not return_ids:
+            raise ValueError("return_ids must be a nonempty list")
+        selected = []
+        seen = set()
+        for return_id in return_ids:
+            return_id = text(return_id, "return_id")
+            if return_id in seen:
+                raise ValueError("duplicate return_id: " + return_id)
+            seen.add(return_id)
+            selected.append(return_id)
+        data = self._read()
+        results = []
+        # Apply in input order so shared-product stock snapshots chain; a
+        # failure anywhere (including the last entry) discards every in-memory
+        # change because the file is only written once the whole batch has
+        # succeeded.
+        for return_id in selected:
+            results.append(self._receive_return(data, return_id))
+        self._write(data)
+        return sorted(results, key=lambda receipt: receipt["return_id"])
+
+    def _receive_return(self, data, return_id):
+        # Shared mutation for receive_return and receive_return_batch: the
+        # caller has normalized the id and writes `data` once everything has
+        # succeeded.
         located = self._find_return(data, return_id)
         if located is None:
             raise ValueError("unknown return: " + return_id)
@@ -1234,7 +1268,6 @@ class OrderDesk(JsonStore):
         result = {"order_id": order_id, "return_id": return_id, "lines": result_lines}
         data.setdefault("return_receipts", {})[return_id] = copy.deepcopy(result)
         self._record_event(data, order_id, "receive-return", result, False)
-        self._write(data)
         return result
 
     def get_return_receipt(self, return_id):
