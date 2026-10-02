@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import os
 import tempfile
+from datetime import date
 
 class JsonStore:
     def __init__(self, root):
@@ -36,4 +37,16 @@ def text(value, label):
 def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")
+    return value
+
+def calendar_date(value, label):
+    # The caller supplies the date; the system clock is never read. Only a
+    # trimmed real YYYY-MM-DD calendar date (so 2026-02-29 is rejected) passes.
+    value = text(value, label)
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(label + " must be a valid YYYY-MM-DD calendar date") from None
+    if parsed.isoformat() != value:
+        raise ValueError(label + " must be a valid YYYY-MM-DD calendar date")
     return value
