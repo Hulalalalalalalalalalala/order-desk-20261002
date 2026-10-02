@@ -1,6 +1,19 @@
+import copy
 from .storage import JsonStore, text, positive
 
 class OrderDesk(JsonStore):
+    def _record_event(self, data, order_id, action, result, complete):
+        # Each order counts its own events from 1; legacy orders start with
+        # complete=False the first time a new operation is recorded.
+        document = data.setdefault("history", {}).setdefault(
+            order_id, {"complete": complete, "events": []}
+        )
+        document["events"].append({
+            "sequence": len(document["events"]) + 1,
+            "action": action,
+            "result": copy.deepcopy(result),
+        })
+
     def add_product(self, sku, name, price_cents):
         sku, name = text(sku, "sku"), text(name, "name")
         if type(price_cents) is not int or price_cents < 0:
@@ -75,6 +88,7 @@ class OrderDesk(JsonStore):
             data.setdefault("reservations", {})[order_id] = reservations
         order = {"order_id": order_id, "status": "placed", "lines": items, "total_cents": sum(x["subtotal_cents"] for x in items)}
         data.setdefault("orders", {})[order_id] = order
+        self._record_event(data, order_id, "place", order, True)
         self._write(data)
         return order
 
@@ -97,6 +111,7 @@ class OrderDesk(JsonStore):
                 if entry is not None:
                     entry["reserved"] -= quantity
         order["status"] = "cancelled"
+        self._record_event(data, order_id, "cancel", order, False)
         self._write(data)
         return order
 
@@ -124,6 +139,7 @@ class OrderDesk(JsonStore):
                     entry["reserved"] -= quantity
         order["status"] = "shipped"
         order["shipment"] = {"carrier": carrier, "tracking_no": tracking_no}
+        self._record_event(data, order_id, "ship", order, False)
         self._write(data)
         return order
 
@@ -171,6 +187,7 @@ class OrderDesk(JsonStore):
             "lines": [{"sku": sku, "quantity": requested[sku]} for sku in sorted(requested)],
         }
         data.setdefault("returns", {}).setdefault(order_id, []).append(record)
+        self._record_event(data, order_id, "record-return", record, False)
         self._write(data)
         return record
 
@@ -190,3 +207,21 @@ class OrderDesk(JsonStore):
                 returned[line["sku"]] = returned.get(line["sku"], 0) + line["quantity"]
         remaining = [{"sku": sku, "quantity": ordered[sku] - returned.get(sku, 0)} for sku in sorted(ordered)]
         return {"order_id": order_id, "records": records, "remaining": remaining}
+
+    def history(self, order_id):
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        document = data.get("history", {}).get(order_id)
+        if document is None:
+            # Orders created before history existed: never fabricate events
+            # from their current status or returns.
+            return {"order_id": order_id, "status": order["status"], "complete": False, "events": []}
+        return {
+            "order_id": order_id,
+            "status": order["status"],
+            "complete": document["complete"],
+            "events": copy.deepcopy(document["events"]),
+        }
