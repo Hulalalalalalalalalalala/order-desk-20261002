@@ -407,6 +407,82 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def pick_list(self, order_ids):
+        # Read-only picking summary across the selected placed orders: it merges
+        # quantities by sku while keeping per-order demand and reservation
+        # detail. It never writes, never fabricates reservations for orders
+        # placed before a product became managed, and never counts reservations
+        # held by orders outside the selection.
+        if not isinstance(order_ids, list) or not order_ids:
+            raise ValueError("order_ids must be a nonempty list")
+        selected = []
+        seen = set()
+        for order_id in order_ids:
+            order_id = text(order_id, "order_id")
+            if order_id in seen:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen.add(order_id)
+            selected.append(order_id)
+        data = self._read()
+        orders = data.get("orders", {})
+        all_reservations = data.get("reservations", {})
+        inventory = data.get("inventory", {})
+        # Merge duplicate sku lines inside each order first; the whole query is
+        # rejected if any selected order is missing or no longer placed.
+        demanded = {}  # order_id -> {sku: merged quantity}
+        for order_id in selected:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be picked: " + order_id)
+            per_order = {}
+            for line in order["lines"]:
+                per_order[line["sku"]] = per_order.get(line["sku"], 0) + line["quantity"]
+            demanded[order_id] = per_order
+        skus = set()
+        for per_order in demanded.values():
+            skus.update(per_order)
+        lines = []
+        for sku in sorted(skus):
+            quantity = 0
+            reserved = 0
+            order_rows = []
+            for order_id in sorted(demanded):
+                per_order = demanded[order_id]
+                if sku not in per_order:
+                    continue
+                order_quantity = per_order[sku]
+                quantity += order_quantity
+                order_reserved = all_reservations.get(order_id, {}).get(sku, 0)
+                reserved += order_reserved
+                order_rows.append({
+                    "order_id": order_id,
+                    "quantity": order_quantity,
+                    "reserved": order_reserved,
+                })
+            entry = inventory.get(sku)
+            if entry is None:
+                # Legacy data without an inventory record stays unmanaged: no
+                # availability, no reservations and no shortfall.
+                available = None
+                reserved = 0
+                shortfall = 0
+                for row in order_rows:
+                    row["reserved"] = 0
+            else:
+                available = entry["on_hand"] - entry["reserved"]
+                shortfall = max(0, quantity - reserved - available)
+            lines.append({
+                "sku": sku,
+                "quantity": quantity,
+                "reserved": reserved,
+                "available": available,
+                "shortfall": shortfall,
+                "orders": order_rows,
+            })
+        return {"order_ids": sorted(selected), "lines": lines}
+
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
 
