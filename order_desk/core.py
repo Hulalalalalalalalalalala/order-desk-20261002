@@ -410,6 +410,85 @@ class OrderDesk(JsonStore):
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
 
+    def pick_list(self, order_ids):
+        # Read-only picking summary: merge current demand across the selected
+        # placed orders, keeping each order's quantity and actual reservation.
+        # Never creates files and never touches stock, orders, carts, history
+        # or sequence counters.
+        if not isinstance(order_ids, list) or not order_ids:
+            raise ValueError("order_ids must be a nonempty list")
+        selected = []
+        seen = set()
+        for raw in order_ids:
+            order_id = text(raw, "order_id")
+            if order_id in seen:
+                raise ValueError("duplicate order id: " + order_id)
+            seen.add(order_id)
+            selected.append(order_id)
+        data = self._read()
+        orders = data.get("orders", {})
+        # Validate every id before building the summary, so a missing or
+        # non-placed order never yields a partial result.
+        for order_id in selected:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be picked: " + order_id)
+        all_reservations = data.get("reservations", {})
+        inventory = data.get("inventory", {})
+        lines = {}
+        for order_id in selected:
+            reserved = all_reservations.get(order_id, {})
+            demanded = {}
+            for line in orders[order_id]["lines"]:
+                demanded[line["sku"]] = demanded.get(line["sku"], 0) + line["quantity"]
+            for sku, quantity in demanded.items():
+                entry = lines.setdefault(sku, {"quantity": 0, "orders": {}})
+                entry["quantity"] += quantity
+                # Only this order's own reservation record counts; orders
+                # without a record (or an SKU reserved only later) read as 0.
+                entry["orders"][order_id] = {
+                    "order_id": order_id,
+                    "quantity": quantity,
+                    "reserved": reserved.get(sku, 0),
+                }
+        result_lines = []
+        for sku in sorted(lines):
+            entry = lines[sku]
+            stock_entry = inventory.get(sku)
+            managed = stock_entry is not None
+            order_views = []
+            for oid in sorted(entry["orders"]):
+                view = entry["orders"][oid]
+                if not managed:
+                    # No stock record means unmanaged: no reservation is
+                    # counted even if a stale record mentions the sku.
+                    view["reserved"] = 0
+                order_views.append(view)
+            if not managed:
+                # Legacy data without a stock record stays unmanaged: no
+                # available figure, and demand is never treated as reserved.
+                reserved_total = 0
+                available = None
+                shortfall = 0
+            else:
+                available = stock_entry["on_hand"] - stock_entry["reserved"]
+                reserved_total = sum(view["reserved"] for view in order_views)
+                # Shortfall starts from what the selected orders still need
+                # beyond their own reservations and current free stock; fully
+                # reserved demand shows no gap even when available is zero.
+                shortfall = max(0, entry["quantity"] - reserved_total - available)
+            result_lines.append({
+                "sku": sku,
+                "quantity": entry["quantity"],
+                "reserved": reserved_total,
+                "available": available,
+                "shortfall": shortfall,
+                "orders": order_views,
+            })
+        return {"order_ids": sorted(selected), "lines": result_lines}
+
     def record_return(self, order_id, return_id, lines):
         order_id = text(order_id, "order_id")
         return_id = text(return_id, "return_id")
