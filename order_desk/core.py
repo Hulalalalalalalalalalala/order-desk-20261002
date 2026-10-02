@@ -691,6 +691,81 @@ class OrderDesk(JsonStore):
             raise ValueError("return has not been received: " + return_id)
         return copy.deepcopy(receipt)
 
+    def return_worklist(self, stage="pending", order_id=None):
+        # Read-only handling list across one order or the whole root. Stages are
+        # derived from the active/cancelled registration records and receive
+        # receipts; orphan receipts or history events never fabricate entries.
+        if not isinstance(stage, str):
+            raise ValueError("stage must be a string")
+        stage = stage.strip()
+        if stage not in ("pending", "received", "cancelled", "all"):
+            raise ValueError("invalid stage: " + stage)
+        if order_id is not None:
+            order_id = text(order_id, "order_id")
+        data = self._read()
+        orders = data.get("orders", {})
+        if order_id is not None and order_id not in orders:
+            raise ValueError("unknown order: " + order_id)
+        gathered = []  # (record, cancelled)
+        if order_id is not None:
+            for record in data.get("returns", {}).get(order_id, []):
+                gathered.append((record, False))
+            for record in data.get("cancelled_returns", {}).get(order_id, []):
+                gathered.append((record, True))
+        else:
+            for records in data.get("returns", {}).values():
+                for record in records:
+                    gathered.append((record, False))
+            for records in data.get("cancelled_returns", {}).values():
+                for record in records:
+                    gathered.append((record, True))
+        # Every registration in scope must belong to an existing shipped order;
+        # one legacy bad record rejects the whole query, never partial results.
+        for record, _ in gathered:
+            owner = orders.get(record["order_id"])
+            if owner is None:
+                raise ValueError("unknown order: " + record["order_id"])
+            if owner["status"] != "shipped":
+                raise ValueError(
+                    "only a shipped order can appear on the return worklist: " + record["order_id"]
+                )
+        receipts = data.get("return_receipts", {})
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        entries = []
+        for record, cancelled in gathered:
+            if cancelled:
+                current = "cancelled"
+            elif record["return_id"] in receipts:
+                current = "received"
+            else:
+                current = "pending"
+            if stage != "all" and current != stage:
+                continue
+            quantities = {}
+            for line in record["lines"]:
+                quantities[line["sku"]] = quantities.get(line["sku"], 0) + line["quantity"]
+            lines = [{"sku": sku, "quantity": quantities[sku]} for sku in sorted(quantities)]
+            # Only pending returns are checked against the current catalog and
+            # inventory; pausing sales does not block receiving.
+            blockers = []
+            if current == "pending":
+                for sku in sorted(quantities):
+                    if sku not in products:
+                        blockers.append({"sku": sku, "reason": "unknown-product"})
+                    elif sku not in inventory:
+                        blockers.append({"sku": sku, "reason": "unmanaged"})
+            entries.append({
+                "order_id": record["order_id"],
+                "return_id": record["return_id"],
+                "stage": current,
+                "lines": lines,
+                "can_receive": current == "pending" and not blockers,
+                "blockers": blockers,
+            })
+        entries.sort(key=lambda x: x["return_id"])
+        return entries
+
     def history(self, order_id):
         order_id = text(order_id, "order_id")
         data = self._read()
