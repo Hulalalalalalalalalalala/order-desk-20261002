@@ -658,6 +658,90 @@ class OrderDesk(JsonStore):
             })
         return {"order_ids": sorted(selected), "lines": lines}
 
+    def reservation_plan(self, order_ids):
+        # Read-only preview of reservation top-ups in the given priority order:
+        # each order's new demand (merged quantity minus its actual reserved
+        # amount, floored at zero) is checked against a simulated availability
+        # pool seeded from stock's available. Orders that can be fully topped
+        # up deduct their new demand from the pool; orders that cannot leave
+        # the pool untouched and never block later orders. Existing
+        # reservations are never released or moved between orders, and nothing
+        # is written.
+        if not isinstance(order_ids, list) or not order_ids:
+            raise ValueError("order_ids must be a nonempty list")
+        selected = []
+        seen = set()
+        for order_id in order_ids:
+            order_id = text(order_id, "order_id")
+            if order_id in seen:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen.add(order_id)
+            selected.append(order_id)
+        data = self._read()
+        orders = data.get("orders", {})
+        products = data.get("products", {})
+        all_reservations = data.get("reservations", {})
+        inventory = data.get("inventory", {})
+        # Merge duplicate sku lines inside each order and validate the whole
+        # selection first, so a rejected plan raises instead of returning
+        # partial results. A missing reservation record reads as zero.
+        demanded = {}  # order_id -> {sku: merged quantity}
+        for order_id in selected:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be planned: " + order_id)
+            per_order = {}
+            for line in order["lines"]:
+                sku = line["sku"]
+                if sku not in products:
+                    raise ValueError("unknown product: " + sku)
+                per_order[sku] = per_order.get(sku, 0) + line["quantity"]
+            demanded[order_id] = per_order
+        # Simulated remaining availability per managed sku. Unmanaged skus
+        # (including legacy data without inventory records) are unlimited and
+        # never enter or consume the pool.
+        pool = {sku: entry["on_hand"] - entry["reserved"] for sku, entry in inventory.items()}
+        plan = []
+        for order_id in selected:
+            own = all_reservations.get(order_id, {})
+            lines = []
+            additions = {}
+            can_reserve = True
+            for sku in sorted(demanded[order_id]):
+                quantity = demanded[order_id][sku]
+                if sku not in pool:
+                    lines.append({
+                        "sku": sku,
+                        "quantity": quantity,
+                        "reserved": 0,
+                        "available": None,
+                        "shortfall": 0,
+                    })
+                    continue
+                reserved = own.get(sku, 0)
+                needed = max(0, quantity - reserved)
+                available = pool[sku]
+                shortfall = max(0, needed - available)
+                if shortfall:
+                    can_reserve = False
+                additions[sku] = needed
+                lines.append({
+                    "sku": sku,
+                    "quantity": quantity,
+                    "reserved": reserved,
+                    "available": available,
+                    "shortfall": shortfall,
+                })
+            if can_reserve:
+                # Only a fully reservable order consumes the pool; a rejected
+                # order deducts nothing, even for skus it could have covered.
+                for sku, needed in additions.items():
+                    pool[sku] -= needed
+            plan.append({"order_id": order_id, "can_reserve": can_reserve, "lines": lines})
+        return plan
+
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
 
