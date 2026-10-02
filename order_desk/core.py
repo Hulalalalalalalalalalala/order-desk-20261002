@@ -393,6 +393,13 @@ class OrderDesk(JsonStore):
             raise ValueError("order already shipped")
         if order["status"] != "placed":
             raise ValueError("only a placed order can be shipped")
+        order = self._ship_order(data, order_id, carrier, tracking_no)
+        self._write(data)
+        return order
+
+    def _ship_order(self, data, order_id, carrier, tracking_no):
+        # Shared mutation for ship and ship_batch: the caller has already
+        # validated the order against `data` and is responsible for writing.
         reservations = data.get("reservations", {}).pop(order_id, None)
         if reservations:
             inventory = data.get("inventory", {})
@@ -401,11 +408,49 @@ class OrderDesk(JsonStore):
                 if entry is not None:
                     entry["on_hand"] -= quantity
                     entry["reserved"] -= quantity
+        order = data.get("orders", {})[order_id]
         order["status"] = "shipped"
         order["shipment"] = {"carrier": carrier, "tracking_no": tracking_no}
         self._record_event(data, order_id, "ship", order, False)
-        self._write(data)
         return order
+
+    def ship_batch(self, shipments):
+        # Whole-batch shipment: every order ships or none do. Validate every
+        # item, order and status first, so a rejected batch leaves inventory,
+        # reservations, orders and history byte-for-byte untouched.
+        if not isinstance(shipments, list) or not shipments:
+            raise ValueError("shipments must be a nonempty list")
+        entries = []
+        seen = set()
+        for item in shipments:
+            if not isinstance(item, dict):
+                raise ValueError("each shipment must be an object with order_id, carrier and tracking_no")
+            order_id = text(item.get("order_id"), "order_id")
+            carrier = text(item.get("carrier"), "carrier")
+            tracking_no = text(item.get("tracking_no"), "tracking_no")
+            if order_id in seen:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen.add(order_id)
+            entries.append((order_id, carrier, tracking_no))
+        data = self._read()
+        orders = data.get("orders", {})
+        for order_id, _carrier, _tracking_no in entries:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] == "cancelled":
+                raise ValueError("a cancelled order cannot be shipped")
+            if order["status"] == "shipped":
+                raise ValueError("order already shipped")
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be shipped")
+        # All inputs are valid: only now are reservations, order statuses and
+        # history touched, and the whole batch is saved in a single write.
+        shipped = []
+        for order_id, carrier, tracking_no in entries:
+            shipped.append(self._ship_order(data, order_id, carrier, tracking_no))
+        self._write(data)
+        return sorted(shipped, key=lambda x: x["order_id"])
 
     def pick_list(self, order_ids):
         # Read-only picking summary across the selected placed orders: it merges
