@@ -92,6 +92,52 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def quote(self, lines):
+        # Preview only: validate and merge the request against current catalog
+        # and inventory without creating an order or writing anything.
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        items = []
+        can_place = True
+        for sku in sorted(requested):
+            product = products.get(sku)
+            if product is None:
+                raise ValueError("unknown product: " + sku)
+            quantity = requested[sku]
+            unit_price = product["price_cents"]
+            entry = inventory.get(sku)
+            if entry is None:
+                # Unmanaged products (including legacy data without inventory
+                # fields) have no availability limit.
+                available = None
+                shortfall = 0
+            else:
+                available = entry["on_hand"] - entry["reserved"]
+                shortfall = quantity - available
+                if shortfall <= 0:
+                    shortfall = 0
+                else:
+                    can_place = False
+            items.append({
+                "sku": sku,
+                "quantity": quantity,
+                "unit_price_cents": unit_price,
+                "subtotal_cents": quantity * unit_price,
+                "available": available,
+                "shortfall": shortfall,
+            })
+        return {"lines": items, "total_cents": sum(x["subtotal_cents"] for x in items), "can_place": can_place}
+
     def get(self, order_id):
         try:
             return self._read().get("orders", {})[order_id]
