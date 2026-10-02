@@ -521,6 +521,94 @@ class OrderDesk(JsonStore):
         self._write(data)
         return results
 
+    def transfer_reservation(self, source_id, target_id, lines):
+        # Move reserved quantity between two placed orders: the source gives up
+        # part of its actual reservation and the target receives it. Only the
+        # per-order reservation records change -- on_hand, total reserved and
+        # available stay exactly as they were, no stock history is recorded,
+        # and no other order is touched. Paused sales never block a transfer.
+        source_id = text(source_id, "source_id")
+        target_id = text(target_id, "target_id")
+        if source_id == target_id:
+            raise ValueError("source and target orders must differ")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        orders = data.get("orders", {})
+        source = orders.get(source_id)
+        target = orders.get(target_id)
+        if source is None:
+            raise ValueError("unknown order: " + source_id)
+        if target is None:
+            raise ValueError("unknown order: " + target_id)
+        if source["status"] != "placed":
+            raise ValueError("only a placed order can transfer reservations: " + source_id)
+        if target["status"] != "placed":
+            raise ValueError("only a placed order can receive reservations: " + target_id)
+        ordered = {}
+        for order_id, order in ((source_id, source), (target_id, target)):
+            merged = {}
+            for line in order["lines"]:
+                merged[line["sku"]] = merged.get(line["sku"], 0) + line["quantity"]
+            ordered[order_id] = merged
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        all_reservations = data.get("reservations", {})
+        source_own = all_reservations.get(source_id, {})
+        target_own = all_reservations.get(target_id, {})
+        # Validate every sku against the catalog, both orders and the current
+        # balances before touching any reservation record, so a rejected
+        # transfer leaves data, history and sequences untouched. Missing
+        # reservation records read as zero; available stock is never borrowed.
+        for sku in sorted(requested):
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            if sku not in inventory:
+                raise ValueError("product is not managed: " + sku)
+            if sku not in ordered[source_id] or sku not in ordered[target_id]:
+                raise ValueError("product must appear in both orders: " + sku)
+            quantity = requested[sku]
+            if quantity > source_own.get(sku, 0):
+                raise ValueError("insufficient reserved quantity: " + sku)
+            if target_own.get(sku, 0) + quantity > ordered[target_id][sku]:
+                raise ValueError("transfer exceeds target ordered quantity: " + sku)
+        lines_out = []
+        for sku in sorted(requested):
+            quantity = requested[sku]
+            lines_out.append({
+                "sku": sku,
+                "quantity": quantity,
+                "source_reserved": source_own.get(sku, 0) - quantity,
+                "target_reserved": target_own.get(sku, 0) + quantity,
+            })
+        result = {"source_id": source_id, "target_id": target_id, "lines": lines_out}
+        reservations = data.setdefault("reservations", {})
+        source_record = reservations[source_id]
+        target_record = reservations.setdefault(target_id, {})
+        for sku, quantity in requested.items():
+            remaining = source_record[sku] - quantity
+            if remaining:
+                source_record[sku] = remaining
+            else:
+                # Zero-quantity entries are never stored; a missing record
+                # reads as zero everywhere else.
+                del source_record[sku]
+            target_record[sku] = target_record.get(sku, 0) + quantity
+        if not source_record:
+            reservations.pop(source_id, None)
+        snapshot = copy.deepcopy(result)
+        self._record_event(data, source_id, "transfer-reservation", snapshot, False)
+        self._record_event(data, target_id, "transfer-reservation", snapshot, False)
+        self._write(data)
+        return result
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
