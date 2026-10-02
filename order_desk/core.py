@@ -665,6 +665,78 @@ class OrderDesk(JsonStore):
         self._write(data)
         return result
 
+    def release_reservation(self, order_id, lines):
+        # Release part of a placed order's own reservations back to available
+        # stock without cancelling the order or naming a receiving order: this
+        # order's reservation and the product total drop together, availability
+        # rises by the same amount, and on_hand, deal lines, prices, amounts,
+        # status and other orders' reservations are never touched. Paused sales
+        # never block a release.
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can release a reservation")
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        ordered = set()
+        for line in order["lines"]:
+            ordered.add(line["sku"])
+        own = data.get("reservations", {}).get(order_id, {})
+        # Validate every sku against catalog, managed stock, the order's current
+        # lines and its current balance before touching any record, so a
+        # rejected release leaves stock, reservations and history untouched. A
+        # missing reservation record reads as zero.
+        for sku in sorted(requested):
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            if sku not in inventory:
+                raise ValueError("product is not managed: " + sku)
+            if sku not in ordered:
+                raise ValueError("sku not in order: " + sku)
+        for sku, quantity in requested.items():
+            if quantity > own.get(sku, 0):
+                raise ValueError("order reservation is insufficient: " + sku)
+        records = data.setdefault("reservations", {})
+        record = records.setdefault(order_id, {})
+        result_lines = []
+        for sku in sorted(requested):
+            quantity = requested[sku]
+            entry = inventory[sku]
+            before = self._stock_view(sku, entry)
+            entry["reserved"] -= quantity
+            after = self._stock_view(sku, entry)
+            remaining = record.get(sku, 0) - quantity
+            if remaining:
+                record[sku] = remaining
+            else:
+                record.pop(sku, None)
+            self._record_stock_event(data, sku, "release-reservation", order_id, before, after)
+            result_lines.append({
+                "sku": sku,
+                "quantity": quantity,
+                "reserved": remaining,
+                "before": before,
+                "after": after,
+            })
+        if not record:
+            records.pop(order_id, None)
+        result = {"order_id": order_id, "lines": result_lines}
+        self._record_event(data, order_id, "release-reservation", result, False)
+        self._write(data)
+        return result
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
