@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import date
 import json
 import os
 import tempfile
@@ -36,4 +37,23 @@ def text(value, label):
 def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")
+    return value
+
+def calendar_date(value, label):
+    # Strict calendar date in YYYY-MM-DD: the string is trimmed, then matched
+    # digit-for-digit (ASCII only) before datetime.date validates the real
+    # calendar day, so alternate formats and impossible dates are both rejected.
+    # The value is caller-supplied; the system clock is never read.
+    if not isinstance(value, str):
+        raise ValueError(label + " must be a YYYY-MM-DD date string")
+    value = value.strip()
+    digits = value[:4] + value[5:7] + value[8:]
+    ascii_digits = all("0" <= char <= "9" for char in digits)
+    if len(value) != 10 or value[4] != "-" or value[7] != "-" or not ascii_digits:
+        raise ValueError(label + " must be a YYYY-MM-DD date string")
+    year, month, day = int(value[:4]), int(value[5:7]), int(value[8:])
+    try:
+        date(year, month, day)
+    except ValueError:
+        raise ValueError(label + " must be a real calendar date") from None
     return value

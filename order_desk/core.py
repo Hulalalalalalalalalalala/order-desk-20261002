@@ -1,5 +1,7 @@
 import copy
-from .storage import JsonStore, text, positive
+from .storage import JsonStore, text, positive, calendar_date
+
+FULFILLED_STATUSES = ("shipped", "delivered")
 
 class OrderDesk(JsonStore):
     def _record_event(self, data, order_id, action, result, complete):
@@ -496,6 +498,27 @@ class OrderDesk(JsonStore):
         self._write(data)
         return sorted((order for order, _, _ in planned), key=lambda x: x["order_id"])
 
+    def confirm_delivery(self, order_id, recipient, delivered_on):
+        # Offline proof of receipt: the caller supplies the recipient and the
+        # real calendar date the parcel was signed for, so the system clock is
+        # never read. It only flips a shipped order to delivered and records the
+        # delivery; lines, amounts, shipment, stock, reservations and returns
+        # are all left exactly as they were.
+        order_id = text(order_id, "order_id")
+        recipient = text(recipient, "recipient")
+        delivered_on = calendar_date(delivered_on, "delivered_on")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "shipped":
+            raise ValueError("only a shipped order can be confirmed delivered: " + order_id)
+        order["status"] = "delivered"
+        order["delivery"] = {"recipient": recipient, "delivered_on": delivered_on}
+        self._record_event(data, order_id, "confirm-delivery", order, False)
+        self._write(data)
+        return order
+
     def pick_list(self, order_ids):
         # Read-only picking summary across the selected placed orders: it merges
         # quantities by sku while keeping per-order demand and reservation
@@ -591,7 +614,7 @@ class OrderDesk(JsonStore):
         order = data.get("orders", {}).get(order_id)
         if order is None:
             raise ValueError("unknown order: " + order_id)
-        if order["status"] != "shipped":
+        if order["status"] not in FULFILLED_STATUSES:
             raise ValueError("only a shipped order can accept returns")
         all_returns = data.get("returns", {})
         # Cancelled returns leave the active records but keep their id occupied
@@ -655,7 +678,7 @@ class OrderDesk(JsonStore):
         if cancelled:
             raise ValueError("return already cancelled: " + return_id)
         order = data.get("orders", {}).get(order_id)
-        if order is None or order["status"] != "shipped":
+        if order is None or order["status"] not in FULFILLED_STATUSES:
             raise ValueError("only a shipped order can cancel a return: " + order_id)
         if return_id in data.get("return_receipts", {}):
             raise ValueError("return already received: " + return_id)
@@ -700,7 +723,7 @@ class OrderDesk(JsonStore):
         if cancelled:
             raise ValueError("return already cancelled: " + return_id)
         order = data.get("orders", {}).get(order_id)
-        if order is None or order["status"] != "shipped":
+        if order is None or order["status"] not in FULFILLED_STATUSES:
             raise ValueError("only a shipped order can receive a return: " + order_id)
         if return_id in data.get("return_receipts", {}):
             raise ValueError("return already received: " + return_id)
@@ -785,7 +808,7 @@ class OrderDesk(JsonStore):
             order = orders.get(record["order_id"])
             if order is None:
                 raise ValueError("unknown order: " + record["order_id"])
-            if order["status"] != "shipped":
+            if order["status"] not in FULFILLED_STATUSES:
                 raise ValueError("only a shipped order can be on the return worklist: " + record["order_id"])
         products = data.get("products", {})
         inventory = data.get("inventory", {})
