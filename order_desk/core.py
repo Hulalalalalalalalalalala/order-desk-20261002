@@ -145,13 +145,10 @@ class OrderDesk(JsonStore):
             raise ValueError("unknown stock count: " + count_id)
         return copy.deepcopy(record)
 
-    def place(self, order_id, lines):
-        order_id = text(order_id, "order_id")
-        if not isinstance(lines, list) or not lines:
-            raise ValueError("lines must be a nonempty list")
-        data = self._read()
-        if order_id in data.get("orders", {}):
-            raise ValueError("order already exists")
+    def _place_order(self, data, order_id, lines):
+        # Validate, price and reserve against the loaded document, but never
+        # write: place and cart checkout share this so their failures mutate
+        # nothing. Mutations start only after every line and stock check passes.
         products = data.get("products", {})
         items = []
         needed = {}
@@ -181,6 +178,70 @@ class OrderDesk(JsonStore):
         order = {"order_id": order_id, "status": "placed", "lines": items, "total_cents": sum(x["subtotal_cents"] for x in items)}
         data.setdefault("orders", {})[order_id] = order
         self._record_event(data, order_id, "place", order, True)
+        return order
+
+    def place(self, order_id, lines):
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        data = self._read()
+        if order_id in data.get("orders", {}):
+            raise ValueError("order already exists")
+        order = self._place_order(data, order_id, lines)
+        self._write(data)
+        return order
+
+    @staticmethod
+    def _cart_view(record):
+        return {"cart_id": record["cart_id"], "lines": copy.deepcopy(record["lines"])}
+
+    def save_cart(self, cart_id, lines):
+        cart_id = text(cart_id, "cart_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        products = data.get("products", {})
+        for sku in requested:
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+        # Paused products and insufficient stock are savable: no price is
+        # recorded, no stock reserved and no order history created.
+        record = {
+            "cart_id": cart_id,
+            "lines": [{"sku": sku, "quantity": requested[sku]} for sku in sorted(requested)],
+        }
+        data.setdefault("carts", {})[cart_id] = copy.deepcopy(record)
+        self._write(data)
+        return record
+
+    def get_cart(self, cart_id):
+        cart_id = text(cart_id, "cart_id")
+        record = self._read().get("carts", {}).get(cart_id)
+        if record is None:
+            raise ValueError("unknown cart: " + cart_id)
+        # Read-only: never fill the carts key or create the data file.
+        return self._cart_view(record)
+
+    def checkout_cart(self, cart_id, order_id):
+        cart_id = text(cart_id, "cart_id")
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        record = data.get("carts", {}).get(cart_id)
+        if record is None:
+            raise ValueError("unknown cart: " + cart_id)
+        if order_id in data.get("orders", {}):
+            raise ValueError("order already exists")
+        # Cart and order ids share no namespace: a cart may reuse an existing
+        # order id, and checkout only rejects an occupied order id.
+        order = self._place_order(data, order_id, record["lines"])
+        data["carts"].pop(cart_id)
         self._write(data)
         return order
 
