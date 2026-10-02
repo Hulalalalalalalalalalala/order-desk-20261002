@@ -882,6 +882,53 @@ class OrderDesk(JsonStore):
         self._write(data)
         return sorted((order for order, _, _ in planned), key=lambda x: x["order_id"])
 
+    @staticmethod
+    def _shipment_info(value, label):
+        # A shipment info object carries only carrier and tracking_no; extra
+        # fields are ignored. Both texts are trimmed and must stay nonempty.
+        if not isinstance(value, dict):
+            raise ValueError(label + " must be an object with carrier and tracking_no")
+        return {
+            "carrier": text(value.get("carrier"), "carrier"),
+            "tracking_no": text(value.get("tracking_no"), "tracking_no"),
+        }
+
+    def correct_shipment(self, order_id, expected_shipment, shipment):
+        # Correct the recorded carrier/tracking_no of a shipped or delivered
+        # order after checking the caller's expected values against the current
+        # record. Existing returns never block a correction; status, lines,
+        # amounts, delivery, stock, reservations and return records are never
+        # touched, and no stock history is recorded.
+        order_id = text(order_id, "order_id")
+        expected = self._shipment_info(expected_shipment, "expected_shipment")
+        target = self._shipment_info(shipment, "shipment")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped or delivered order can be corrected")
+        current = order.get("shipment")
+        if not isinstance(current, dict):
+            raise ValueError("order has no shipment to correct: " + order_id)
+        # The stored shipment must itself carry valid texts before it can be
+        # matched or replaced.
+        before = {
+            "carrier": text(current.get("carrier"), "carrier"),
+            "tracking_no": text(current.get("tracking_no"), "tracking_no"),
+        }
+        if expected != before:
+            raise ValueError("expected shipment does not match current shipment: " + order_id)
+        result = {"order_id": order_id, "before": before, "after": target}
+        if target == before:
+            # Check passed but nothing changes: still return the result, but
+            # no file is written and no event or sequence is consumed.
+            return result
+        order["shipment"] = dict(target)
+        self._record_event(data, order_id, "correct-shipment", result, False)
+        self._write(data)
+        return result
+
     def confirm_delivery(self, order_id, recipient, delivered_on):
         # Offline sign-off: a shipped order becomes delivered using a date the
         # caller provides (the system clock is never read). It never touches
