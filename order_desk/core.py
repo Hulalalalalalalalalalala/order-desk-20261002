@@ -22,10 +22,45 @@ class OrderDesk(JsonStore):
         products = data.setdefault("products", {})
         if sku in products:
             raise ValueError("product already exists")
+        # New products sell by default; the enabled flag is only stored once a
+        # set_product_enabled call needs it, so a missing flag reads as enabled.
         product = {"sku": sku, "name": name, "price_cents": price_cents}
         products[sku] = product
         self._write(data)
         return product
+
+    @staticmethod
+    def _is_enabled(product):
+        return product.get("enabled") is not False
+
+    @staticmethod
+    def _product_view(product):
+        return {
+            "sku": product["sku"],
+            "name": product["name"],
+            "price_cents": product["price_cents"],
+            "enabled": product.get("enabled") is not False,
+        }
+
+    def set_product_enabled(self, sku, enabled):
+        sku = text(sku, "sku")
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        data = self._read()
+        product = data.get("products", {}).get(sku)
+        if product is None:
+            raise ValueError("unknown product: " + sku)
+        product["enabled"] = enabled
+        self._write(data)
+        return self._product_view(product)
+
+    def get_product(self, sku):
+        sku = text(sku, "sku")
+        product = self._read().get("products", {}).get(sku)
+        if product is None:
+            raise ValueError("unknown product: " + sku)
+        # Read-only: a missing enabled flag means enabled and is never filled in.
+        return self._product_view(product)
 
     def restock(self, sku, quantity):
         sku = text(sku, "sku")
@@ -125,6 +160,8 @@ class OrderDesk(JsonStore):
             product = products.get(sku)
             if product is None:
                 raise ValueError("unknown product: " + sku)
+            if not self._is_enabled(product):
+                raise ValueError("product is not available for sale: " + sku)
             items.append({"sku": sku, "quantity": quantity, "unit_price_cents": product["price_cents"], "subtotal_cents": quantity * product["price_cents"]})
             needed[sku] = needed.get(sku, 0) + quantity
         inventory = data.get("inventory", {})
@@ -166,12 +203,23 @@ class OrderDesk(JsonStore):
             raise ValueError("unknown order: " + order_id)
         if order["status"] != "placed":
             raise ValueError("only a placed order can be amended")
+        # Paused products may stay in an order, shrink or disappear, but no new
+        # paused SKU can be added and its merged total may never grow. Compare
+        # current ordered quantities against the merged new list -- never
+        # history or actual reservations.
+        current = {}
+        for line in order["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
         products = data.get("products", {})
         items = []
         for sku, quantity in requested:
             product = products.get(sku)
             if product is None:
                 raise ValueError("unknown product: " + sku)
+            if not self._is_enabled(product) and (
+                sku not in current or needed[sku] > current[sku]
+            ):
+                raise ValueError("product is not available for sale: " + sku)
             items.append({"sku": sku, "quantity": quantity, "unit_price_cents": product["price_cents"], "subtotal_cents": quantity * product["price_cents"]})
         inventory = data.get("inventory", {})
         own = data.get("reservations", {}).get(order_id, {})
@@ -223,6 +271,8 @@ class OrderDesk(JsonStore):
             product = products.get(sku)
             if product is None:
                 raise ValueError("unknown product: " + sku)
+            if not self._is_enabled(product):
+                raise ValueError("product is not available for sale: " + sku)
             quantity = requested[sku]
             unit_price = product["price_cents"]
             entry = inventory.get(sku)
