@@ -521,6 +521,93 @@ class OrderDesk(JsonStore):
         self._write(data)
         return results
 
+    def transfer_reservation(self, source_id, target_id, lines):
+        # Move reservations between two placed orders: the source gives up
+        # quantities it actually holds and the target receives them, never
+        # touching on_hand, total reserved, availability, other orders, status,
+        # deal lines, prices or amounts. Paused sales never block a transfer.
+        source_id = text(source_id, "source_id")
+        target_id = text(target_id, "target_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        orders = data.get("orders", {})
+        source = orders.get(source_id)
+        if source is None:
+            raise ValueError("unknown order: " + source_id)
+        target = orders.get(target_id)
+        if target is None:
+            raise ValueError("unknown order: " + target_id)
+        if source["status"] != "placed":
+            raise ValueError("only a placed order can transfer a reservation: " + source_id)
+        if target["status"] != "placed":
+            raise ValueError("only a placed order can receive a reservation: " + target_id)
+        if source_id == target_id:
+            raise ValueError("source and target must be different orders")
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        source_ordered = {}
+        for line in source["lines"]:
+            source_ordered[line["sku"]] = source_ordered.get(line["sku"], 0) + line["quantity"]
+        target_ordered = {}
+        for line in target["lines"]:
+            target_ordered[line["sku"]] = target_ordered.get(line["sku"], 0) + line["quantity"]
+        all_reservations = data.get("reservations", {})
+        source_held = all_reservations.get(source_id, {})
+        target_held = all_reservations.get(target_id, {})
+        # Validate every sku against catalog, managed stock, both orders' lines
+        # and both current balances before touching any record, so a rejected
+        # transfer leaves reservations and history untouched.
+        for sku in sorted(requested):
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            if sku not in inventory:
+                raise ValueError("product is not managed: " + sku)
+            if sku not in source_ordered or sku not in target_ordered:
+                raise ValueError("sku must appear in both orders: " + sku)
+        for sku, quantity in requested.items():
+            if quantity > source_held.get(sku, 0):
+                raise ValueError("source reservation is insufficient: " + sku)
+            if target_held.get(sku, 0) + quantity > target_ordered[sku]:
+                raise ValueError("target reservation would exceed ordered quantity: " + sku)
+        # Source decrement and target increment happen together; the total
+        # reserved per sku is unchanged, so no stock history is recorded.
+        records = data.setdefault("reservations", {})
+        source_record = records.setdefault(source_id, {})
+        target_record = records.setdefault(target_id, {})
+        result_lines = []
+        for sku in sorted(requested):
+            quantity = requested[sku]
+            source_after = source_record.get(sku, 0) - quantity
+            target_after = target_record.get(sku, 0) + quantity
+            if source_after:
+                source_record[sku] = source_after
+            else:
+                source_record.pop(sku, None)
+            target_record[sku] = target_after
+            result_lines.append({
+                "sku": sku,
+                "quantity": quantity,
+                "source_reserved": source_after,
+                "target_reserved": target_after,
+            })
+        if not source_record:
+            records.pop(source_id, None)
+        result = {"source_id": source_id, "target_id": target_id, "lines": result_lines}
+        # Both orders keep the same full snapshot; each continues its own
+        # sequence and legacy orders start at 1 with complete=False.
+        self._record_event(data, source_id, "transfer-reservation", result, False)
+        self._record_event(data, target_id, "transfer-reservation", result, False)
+        self._write(data)
+        return result
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
