@@ -1,6 +1,11 @@
+import copy
+
 from .storage import JsonStore, text, positive
 
 class OrderDesk(JsonStore):
+    def _append_event(self, data, order_id, action, result):
+        events = data.setdefault("history", {}).setdefault(order_id, [])
+        events.append({"sequence": len(events) + 1, "action": action, "result": copy.deepcopy(result)})
     def add_product(self, sku, name, price_cents):
         sku, name = text(sku, "sku"), text(name, "name")
         if type(price_cents) is not int or price_cents < 0:
@@ -75,6 +80,7 @@ class OrderDesk(JsonStore):
             data.setdefault("reservations", {})[order_id] = reservations
         order = {"order_id": order_id, "status": "placed", "lines": items, "total_cents": sum(x["subtotal_cents"] for x in items)}
         data.setdefault("orders", {})[order_id] = order
+        self._append_event(data, order_id, "place", order)
         self._write(data)
         return order
 
@@ -97,6 +103,7 @@ class OrderDesk(JsonStore):
                 if entry is not None:
                     entry["reserved"] -= quantity
         order["status"] = "cancelled"
+        self._append_event(data, order_id, "cancel", order)
         self._write(data)
         return order
 
@@ -124,6 +131,7 @@ class OrderDesk(JsonStore):
                     entry["reserved"] -= quantity
         order["status"] = "shipped"
         order["shipment"] = {"carrier": carrier, "tracking_no": tracking_no}
+        self._append_event(data, order_id, "ship", order)
         self._write(data)
         return order
 
@@ -171,8 +179,23 @@ class OrderDesk(JsonStore):
             "lines": [{"sku": sku, "quantity": requested[sku]} for sku in sorted(requested)],
         }
         data.setdefault("returns", {}).setdefault(order_id, []).append(record)
+        self._append_event(data, order_id, "record-return", record)
         self._write(data)
         return record
+
+    def history(self, order_id):
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        events = data.get("history", {}).get(order_id, [])
+        return {
+            "order_id": order_id,
+            "status": order["status"],
+            "complete": any(event["action"] == "place" for event in events),
+            "events": copy.deepcopy(events),
+        }
 
     def get_returns(self, order_id):
         order_id = text(order_id, "order_id")
