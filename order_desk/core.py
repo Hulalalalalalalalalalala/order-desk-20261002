@@ -1979,6 +1979,49 @@ class OrderDesk(JsonStore):
                 summary_totals[field] += row[field]
         return {"order_count": order_count, "lines": lines, "totals": summary_totals}
 
+    def order_worklist(self, stage="open"):
+        # Read-only cross-order fulfillment worklist: every order's open tasks
+        # (reserve top-up, ship, deliver, receive-return) derived from its
+        # current state, with the full order-progress result embedded. It never
+        # writes, never creates the data directory, never consumes a sequence,
+        # and never fabricates reservations, returns or receipts from history;
+        # missing legacy collections read as empty.
+        if not isinstance(stage, str):
+            raise ValueError("stage must be one of: open, all, reserve, ship, deliver, receive-return")
+        stage = stage.strip()
+        if stage not in ("open", "all", "reserve", "ship", "deliver", "receive-return"):
+            raise ValueError("stage must be one of: open, all, reserve, ship, deliver, receive-return")
+        data = self._read()
+        orders = data.get("orders", {})
+        entries = []
+        for order_id in sorted(orders):
+            progress = self.order_progress(order_id)
+            status = progress["order"]["status"]
+            lines = progress["lines"]
+            tasks = []
+            if status == "placed":
+                # A placed order still needs a reservation top-up when any
+                # managed product's needed (order-progress semantics: ordered
+                # minus actually reserved, never netted against availability)
+                # is positive; unmanaged products never create one. Otherwise
+                # it is ready to ship.
+                if any(line["needed"] > 0 for line in lines):
+                    tasks.append("reserve")
+                else:
+                    tasks.append("ship")
+            elif status == "shipped":
+                tasks.append("deliver")
+            # An active registration without a receipt keeps the receive-return
+            # task for shipped and delivered orders alike, even when its
+            # products are paused, unmanaged or gone from the catalog; pending
+            # quantities in the progress lines already exclude cancelled
+            # records and count amended ones at their latest content.
+            if status in ("shipped", "delivered") and any(line["pending"] > 0 for line in lines):
+                tasks.append("receive-return")
+            if stage == "all" or (stage == "open" and tasks) or stage in tasks:
+                entries.append({"order_id": order_id, "tasks": tasks, "progress": progress})
+        return entries
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
