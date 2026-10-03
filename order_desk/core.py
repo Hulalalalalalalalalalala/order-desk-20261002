@@ -603,6 +603,105 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def reduce_order(self, order_id, lines):
+        # Reduce a placed order while keeping the deal: surviving rows keep
+        # their original relative order and per-row deal unit prices; for each
+        # sku the reduction is taken from the LAST row backwards, zero rows are
+        # removed and surviving duplicate rows are never merged. Subtotals are
+        # recomputed at the preserved prices. Paused sales, catalog-less
+        # products and insufficient stock never block a reduction; whole-order
+        # cancellation still goes through cancel. The order's own reservation
+        # for an involved managed product becomes min(old reservation, merged
+        # remaining quantity) -- only the difference is released, total
+        # reserved drops and availability rises by the same amount, on_hand,
+        # other orders and uninvolved products never change. Missing inventory
+        # or reservation records read as no reservation (never auto-managed or
+        # topped up); a reservation driven to zero loses its attribution key.
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can be reduced")
+        current = {}
+        for line in order["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        remaining_total = {}
+        for sku, quantity in requested.items():
+            if sku not in current:
+                raise ValueError("sku not in order: " + sku)
+            if quantity > current[sku]:
+                raise ValueError("reduced quantity exceeds ordered quantity: " + sku)
+            remaining_total[sku] = current[sku] - quantity
+        # Reducing every line away is a cancellation and is rejected here.
+        if sum(current[sku] - requested.get(sku, 0) for sku in current) == 0:
+            raise ValueError("cannot reduce the whole order; cancel it instead")
+        # Take each sku's reduction from its last row first by walking the
+        # rows backwards, then restore the original relative order. Deal unit
+        # prices travel with their rows and subtotals are recomputed at them;
+        # zero-quantity rows disappear and surviving duplicates stay split.
+        deduct = dict(requested)
+        survivors_reversed = []
+        for line in reversed(order["lines"]):
+            sku = line["sku"]
+            removed = min(line["quantity"], deduct.get(sku, 0))
+            deduct[sku] = deduct.get(sku, 0) - removed
+            quantity = line["quantity"] - removed
+            if quantity:
+                unit_price = line["unit_price_cents"]
+                survivors_reversed.append({
+                    "sku": sku,
+                    "quantity": quantity,
+                    "unit_price_cents": unit_price,
+                    "subtotal_cents": quantity * unit_price,
+                })
+        items = list(reversed(survivors_reversed))
+        inventory = data.get("inventory", {})
+        own = data.get("reservations", {}).get(order_id, {})
+        # Plan every reservation change before mutating inventory, so a
+        # rejection leaves stock, reservations and history untouched. Only
+        # managed products hold reservations; a missing inventory record reads
+        # as no reservation even if a stray attribution key exists.
+        plan = []
+        for sku in requested:
+            entry = inventory.get(sku)
+            if entry is None:
+                continue
+            old = own.get(sku, 0)
+            new = min(old, remaining_total[sku])
+            if new != old:
+                plan.append((sku, old, new))
+        before_views = {sku: self._stock_view(sku, inventory[sku]) for sku, _, _ in plan}
+        record = data.get("reservations", {}).get(order_id)
+        for sku, old, new in sorted(plan):
+            inventory[sku]["reserved"] -= old - new
+            if new:
+                record[sku] = new
+            else:
+                record.pop(sku, None)
+            self._record_stock_event(
+                data, sku, "reduce-order", order_id,
+                before_views[sku], self._stock_view(sku, inventory[sku]),
+            )
+        if record is not None and not record:
+            # The order held no other reservations: drop its attribution.
+            data.get("reservations", {}).pop(order_id, None)
+        order["lines"] = items
+        order["total_cents"] = sum(x["subtotal_cents"] for x in items)
+        self._record_event(data, order_id, "reduce-order", order, False)
+        self._write(data)
+        return order
+
     def reserve_order(self, order_id):
         # Top up reservations for a placed order whose products became managed
         # after it was placed. Deal lines, prices, amounts and status are never
