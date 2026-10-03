@@ -1005,6 +1005,55 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def cancel_batch(self, order_ids):
+        # All-or-nothing batch cancel: every id is normalized and every order
+        # is checked before any mutation, so a rejected batch (even one whose
+        # last entry is invalid) leaves orders, stock, reservations, history
+        # and sequences byte-for-byte untouched and never creates the data
+        # directory.
+        if not isinstance(order_ids, list) or not order_ids:
+            raise ValueError("order_ids must be a nonempty list")
+        selected = []
+        seen = set()
+        for order_id in order_ids:
+            order_id = text(order_id, "order_id")
+            if order_id in seen:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen.add(order_id)
+            selected.append(order_id)
+        data = self._read()
+        orders = data.get("orders", {})
+        planned = []
+        for order_id in selected:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be cancelled: " + order_id)
+            planned.append(order)
+        # Apply in request order so shared-product stock snapshots chain; the
+        # returned array is sorted by order id without changing event order.
+        # Only each order's actual reservations are released -- never
+        # quantities inferred from its lines -- and unmanaged or
+        # later-managed products and legacy orders without reservation
+        # records release nothing.
+        all_reservations = data.get("reservations", {})
+        inventory = data.get("inventory", {})
+        for order in planned:
+            order_id = order["order_id"]
+            reservations = all_reservations.pop(order_id, None)
+            if reservations:
+                for sku in sorted(reservations):
+                    entry = inventory.get(sku)
+                    if entry is not None:
+                        before = self._stock_view(sku, entry)
+                        entry["reserved"] -= reservations[sku]
+                        self._record_stock_event(data, sku, "cancel", order_id, before, self._stock_view(sku, entry))
+            order["status"] = "cancelled"
+            self._record_event(data, order_id, "cancel", order, False)
+        self._write(data)
+        return sorted(planned, key=lambda order: order["order_id"])
+
     def reopen_order(self, order_id):
         # Reopen a cancelled order under its original id: the deal (line order
         # and duplicate lines, quantities, deal prices, subtotals and total) is
