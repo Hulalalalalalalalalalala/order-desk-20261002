@@ -986,11 +986,12 @@ class OrderDesk(JsonStore):
         except KeyError:
             raise ValueError("unknown order: " + order_id) from None
 
-    def cancel(self, order_id):
-        data = self._read()
-        order = data.get("orders", {}).get(order_id)
-        if order is None or order["status"] != "placed":
-            raise ValueError("only a placed order can be cancelled")
+    def _cancel_order(self, data, order):
+        # Shared mutation for cancel and cancel_batch: the caller has already
+        # validated that the order is placed. Releases only this order's actual
+        # reservations, marks it cancelled and appends the cancel event; the
+        # caller is responsible for writing `data`.
+        order_id = order["order_id"]
         reservations = data.get("reservations", {}).pop(order_id, None)
         if reservations:
             inventory = data.get("inventory", {})
@@ -1002,8 +1003,47 @@ class OrderDesk(JsonStore):
                     self._record_stock_event(data, sku, "cancel", order_id, before, self._stock_view(sku, entry))
         order["status"] = "cancelled"
         self._record_event(data, order_id, "cancel", order, False)
+
+    def cancel(self, order_id):
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] != "placed":
+            raise ValueError("only a placed order can be cancelled")
+        self._cancel_order(data, order)
         self._write(data)
         return order
+
+    def cancel_batch(self, order_ids):
+        # All-or-nothing batch cancel: every id is normalized and every order
+        # is checked before any mutation, so a rejected batch leaves orders,
+        # stock, reservations, history and sequences byte-for-byte untouched
+        # and never creates the data directory.
+        if not isinstance(order_ids, list) or not order_ids:
+            raise ValueError("order_ids must be a nonempty list")
+        selected = []
+        seen = set()
+        for order_id in order_ids:
+            order_id = text(order_id, "order_id")
+            if order_id in seen:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen.add(order_id)
+            selected.append(order_id)
+        data = self._read()
+        orders = data.get("orders", {})
+        planned = []
+        for order_id in selected:
+            order = orders.get(order_id)
+            if order is None:
+                raise ValueError("unknown order: " + order_id)
+            if order["status"] != "placed":
+                raise ValueError("only a placed order can be cancelled: " + order_id)
+            planned.append(order)
+        # Apply in input order so shared-product stock snapshots chain; the
+        # returned orders are sorted by id.
+        for order in planned:
+            self._cancel_order(data, order)
+        self._write(data)
+        return sorted(planned, key=lambda order: order["order_id"])
 
     def reopen_order(self, order_id):
         # Reopen a cancelled order under its original id: the deal (line order
