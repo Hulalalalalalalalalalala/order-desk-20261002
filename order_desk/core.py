@@ -395,6 +395,68 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def checkout_cart_part(self, cart_id, order_id, lines):
+        # Part-checkout: only the selected skus/quantities become a new order
+        # priced and reserved against the current catalog and stock via _place;
+        # the cart survives with the leftovers (merged, sorted, zero lines
+        # dropped) and is deleted only when every line was taken. Unselected
+        # lines are never re-validated, so paused, out-of-stock or
+        # catalog-missing leftovers keep their quantities. All validation and
+        # mutation happens in the single read document before one write, so a
+        # rejected request leaves the file byte-for-byte untouched, never
+        # creates the data directory and never consumes a history sequence.
+        cart_id = text(cart_id, "cart_id")
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        carts = data.get("carts", {})
+        cart = carts.get(cart_id)
+        if cart is None:
+            raise ValueError("unknown cart: " + cart_id)
+        current = {}
+        for line in cart["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        # Every merged selection must belong to the cart and fit its current
+        # quantity before anything is priced or reserved.
+        for sku in sorted(requested):
+            if sku not in current:
+                raise ValueError("sku not in cart: " + sku)
+            if requested[sku] > current[sku]:
+                raise ValueError("requested quantity exceeds cart quantity: " + sku)
+        # _place rejects an existing order id and a missing, paused or
+        # under-stocked selected product, reserves current availability for
+        # managed skus (on_hand never changes), leaves unmanaged skus
+        # unlimited and unmanaged, and records the place events -- all in
+        # `data`; this method still owns the single write. The merged, sorted
+        # selection becomes the order's lines.
+        order = self._place(
+            data, order_id,
+            [{"sku": sku, "quantity": requested[sku]} for sku in sorted(requested)],
+        )
+        leftover = {sku: quantity - requested.get(sku, 0) for sku, quantity in current.items()}
+        remaining_lines = [
+            {"sku": sku, "quantity": leftover[sku]}
+            for sku in sorted(leftover) if leftover[sku]
+        ]
+        if remaining_lines:
+            cart["lines"] = remaining_lines
+            result_cart = {"cart_id": cart_id, "lines": copy.deepcopy(remaining_lines)}
+        else:
+            # The whole cart was selected: it is deleted, and a later query of
+            # this id raises exactly like an unknown cart.
+            carts.pop(cart_id, None)
+            result_cart = None
+        self._write(data)
+        return {"order": order, "cart": result_cart}
+
     def amend(self, order_id, lines):
         order_id = text(order_id, "order_id")
         if not isinstance(lines, list) or not lines:
