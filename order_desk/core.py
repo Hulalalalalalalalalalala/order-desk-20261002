@@ -1850,6 +1850,56 @@ class OrderDesk(JsonStore):
             })
         return {"order": self.get(order_id), "history": self.history(order_id), "lines": lines}
 
+    def order_worklist(self, stage="open"):
+        # Read-only cross-order fulfillment worklist: each order's tasks are
+        # derived from its current state, and the embedded progress is the full
+        # order-progress result. It never writes, never creates the data
+        # directory, never consumes a sequence and never fabricates
+        # reservations, returns or receipts from history.
+        if not isinstance(stage, str):
+            raise ValueError(
+                "stage must be one of: open, all, reserve, ship, deliver, receive-return"
+            )
+        stage = stage.strip()
+        if stage not in ("open", "all", "reserve", "ship", "deliver", "receive-return"):
+            raise ValueError(
+                "stage must be one of: open, all, reserve, ship, deliver, receive-return"
+            )
+        data = self._read()
+        entries = []
+        for order in sorted(data.get("orders", {}).values(), key=lambda x: x["order_id"]):
+            order_id = order["order_id"]
+            status = order.get("status")
+            # Reuse order-progress itself so the needed/pending calibers and the
+            # empty-collection semantics can never drift apart.
+            progress = self.order_progress(order_id)
+            tasks = []
+            if status == "placed":
+                # A managed sku short of this order's actual reservation reads
+                # needed > 0 (availability is never netted); unmanaged skus read
+                # needed zero and never raise a reserve task. A placed order
+                # therefore carries reserve or ship, never both.
+                if any(line["needed"] > 0 for line in progress["lines"]):
+                    tasks.append("reserve")
+                else:
+                    tasks.append("ship")
+            elif status == "shipped":
+                tasks.append("deliver")
+            if status in ("shipped", "delivered") and any(
+                line["pending"] > 0 for line in progress["lines"]
+            ):
+                # Active registrations without a receipt keep the receive task
+                # even when a product is paused, missing from the catalog or
+                # unmanaged; cancelled and received registrations read as no
+                # pending quantity, and amended registrations count at their
+                # latest lines.
+                tasks.append("receive-return")
+            # cancelled and delivered-without-pending-returns carry no tasks;
+            # unknown legacy statuses neither. stage=all still embeds them.
+            if stage == "all" or (stage == "open" and tasks) or stage in tasks:
+                entries.append({"order_id": order_id, "tasks": tasks, "progress": progress})
+        return entries
+
     def shipment_orders(self, carrier, tracking_no):
         # Read-only lookup of every order currently shipped under a carrier +
         # tracking number combination: only the order's current shipment object
