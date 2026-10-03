@@ -1659,6 +1659,64 @@ class OrderDesk(JsonStore):
             "events": copy.deepcopy(document["events"]),
         }
 
+    def order_progress(self, order_id):
+        # Read-only single-order fulfillment overview: the full order and
+        # history results (identical to get/history) plus per-sku fulfillment
+        # quantities. It never writes, never fabricates reservations, returns or
+        # receipts from history, and missing legacy collections read as empty.
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        status = order["status"]
+        shipped = status in ("shipped", "delivered")
+        ordered = {}
+        for line in order["lines"]:
+            ordered[line["sku"]] = ordered.get(line["sku"], 0) + line["quantity"]
+        inventory = data.get("inventory", {})
+        own = data.get("reservations", {}).get(order_id, {})
+        # Active registrations only: cancelled records live in a separate
+        # bucket and never count. An active record counts as received when it
+        # holds a receipt, otherwise pending; an amended registration's current
+        # lines already are its latest list.
+        pending = {}
+        received = {}
+        if shipped:
+            receipts = data.get("return_receipts", {})
+            for record in data.get("returns", {}).get(order_id, ()):
+                bucket = received if record["return_id"] in receipts else pending
+                for line in record["lines"]:
+                    bucket[line["sku"]] = bucket.get(line["sku"], 0) + line["quantity"]
+        lines = []
+        for sku in sorted(ordered):
+            quantity = ordered[sku]
+            # Managed-ness follows the inventory records: stray reservations
+            # for an unmanaged sku read as zero. Only placed orders still hold
+            # reservations; other statuses read both reservation fields zero.
+            if status == "placed" and sku in inventory:
+                reserved = own.get(sku, 0)
+                needed = max(0, quantity - reserved)
+            else:
+                reserved = 0
+                needed = 0
+            shipped_qty = quantity if shipped else 0
+            pending_qty = pending.get(sku, 0)
+            received_qty = received.get(sku, 0)
+            remaining = quantity - pending_qty - received_qty if shipped else 0
+            lines.append({
+                "sku": sku,
+                "ordered": quantity,
+                "reserved": reserved,
+                "needed": needed,
+                "shipped": shipped_qty,
+                "pending": pending_qty,
+                "received": received_qty,
+                "remaining": remaining,
+                "net": shipped_qty - received_qty,
+            })
+        return {"order": self.get(order_id), "history": self.history(order_id), "lines": lines}
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
