@@ -785,6 +785,60 @@ class OrderDesk(JsonStore):
             "can_place": can_place,
         }
 
+    def quote_return(self, order_id, lines):
+        # Read-only preview before record_return: prices the requested lines at
+        # the order's saved deal unit prices and reports the current returnable
+        # allowance (active registrations, received ones included, count;
+        # cancelled registrations and amended-away quantities do not). It never
+        # creates a return, never refunds and never writes; paused sales,
+        # unmanaged stock and products missing from the current catalog never
+        # block previewing original-order products, and an over-quota request
+        # still returns its full amount with can_record=False.
+        order_id = text(order_id, "order_id")
+        requested, _ = self._merged_return_lines(lines, "lines")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped order can quote a return")
+        ordered = {}
+        for line in order["lines"]:
+            ordered[line["sku"]] = ordered.get(line["sku"], 0) + line["quantity"]
+        returned = {}
+        for record in data.get("returns", {}).get(order_id, []):
+            for line in record["lines"]:
+                returned[line["sku"]] = returned.get(line["sku"], 0) + line["quantity"]
+        result_lines = []
+        can_record = True
+        for sku in sorted(requested):
+            if sku not in ordered:
+                raise ValueError("sku not in original order: " + sku)
+            # Deal price only: every original-order row for this sku must carry
+            # the same nonnegative integer unit price; the catalog price is
+            # never substituted, even when the product is gone from it.
+            deal_prices = [line.get("unit_price_cents") for line in order["lines"] if line["sku"] == sku]
+            unit_price = deal_prices[0]
+            if type(unit_price) is not int or unit_price < 0 or any(price != unit_price for price in deal_prices):
+                raise ValueError("invalid deal unit price for sku: " + sku)
+            quantity = requested[sku]
+            remaining = ordered[sku] - returned.get(sku, 0)
+            if quantity > remaining:
+                can_record = False
+            result_lines.append({
+                "sku": sku,
+                "quantity": quantity,
+                "unit_price_cents": unit_price,
+                "subtotal_cents": quantity * unit_price,
+                "remaining": remaining,
+            })
+        return {
+            "order_id": order_id,
+            "lines": result_lines,
+            "total_cents": sum(line["subtotal_cents"] for line in result_lines),
+            "can_record": can_record,
+        }
+
     def get(self, order_id):
         try:
             return self._read().get("orders", {})[order_id]
