@@ -1117,6 +1117,55 @@ class OrderDesk(JsonStore):
             })
         return results
 
+    def reservation_audit(self, sku):
+        # Read-only per-product reconciliation of the reserved total against
+        # the placed orders that actually hold reservations for it. It never
+        # writes, never fabricates reservations from deal lines or history,
+        # and never fixes stock or attribution when the books disagree.
+        sku = text(sku, "sku")
+        data = self._read()
+        if sku not in data.get("products", {}):
+            raise ValueError("unknown product: " + sku)
+        entry = data.get("inventory", {}).get(sku)
+        if entry is None:
+            # Unmanaged products keep stock's null semantics.
+            stock = {"sku": sku, "on_hand": None, "reserved": 0, "available": None}
+        else:
+            stock = self._stock_view(sku, entry)
+        all_reservations = data.get("reservations", {})
+        rows = []
+        allocated = 0
+        for order in sorted(data.get("orders", {}).values(), key=lambda x: x["order_id"]):
+            # Cancelled, shipped and delivered orders no longer hold demand;
+            # carts and returns never enter the detail.
+            if order["status"] != "placed":
+                continue
+            quantity = 0
+            for line in order["lines"]:
+                if line["sku"] == sku:
+                    quantity += line["quantity"]
+            if not quantity:
+                continue
+            if entry is None:
+                # Unmanaged products never carry reservations.
+                reserved = 0
+            else:
+                # A missing reservation record reads as zero.
+                reserved = all_reservations.get(order["order_id"], {}).get(sku, 0)
+            allocated += reserved
+            rows.append({
+                "order_id": order["order_id"],
+                "quantity": quantity,
+                "reserved": reserved,
+                "unreserved": max(0, quantity - reserved),
+            })
+        return {
+            "stock": stock,
+            "allocated": allocated,
+            "difference": stock["reserved"] - allocated,
+            "orders": rows,
+        }
+
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
 
