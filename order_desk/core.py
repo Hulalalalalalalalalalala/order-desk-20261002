@@ -1893,9 +1893,18 @@ class OrderDesk(JsonStore):
         if order_id is not None:
             order_id = text(order_id, "order_id")
         data = self._read()
-        orders = data.get("orders", {})
-        if order_id is not None and order_id not in orders:
+        if order_id is not None and order_id not in data.get("orders", {}):
             raise ValueError("unknown order: " + order_id)
+        return self._scoped_return_entries(data, stage, order_id)
+
+    def _scoped_return_entries(self, data, stage, order_id):
+        # Builds the return-worklist entries for one scope: stage is one of
+        # pending/received/cancelled/all and order_id optionally narrows to one
+        # order. Every in-scope registration must belong to an existing
+        # shipped/delivered order before views are built, so one bad legacy
+        # record rejects the whole query instead of surfacing partial results.
+        # Never writes or fabricates records.
+        orders = data.get("orders", {})
         receipts = data.get("return_receipts", {})
         # Collect (record, record_stage) pairs in scope. Active records come
         # first, cancelled ones after; the final result is sorted by return_id.
@@ -1929,29 +1938,146 @@ class OrderDesk(JsonStore):
         inventory = data.get("inventory", {})
         entries = []
         for record, record_stage in scoped:
-            quantities = {}
-            for line in record["lines"]:
-                quantities[line["sku"]] = quantities.get(line["sku"], 0) + line["quantity"]
-            lines = [{"sku": sku, "quantity": quantities[sku]} for sku in sorted(quantities)]
-            blockers = []
-            if record_stage == "pending":
-                # Only pending entries are checked against the current catalog
-                # and inventory; paused sales never block receiving.
-                for sku in sorted(quantities):
-                    if sku not in products:
-                        blockers.append({"sku": sku, "reason": "unknown-product"})
-                    elif sku not in inventory:
-                        blockers.append({"sku": sku, "reason": "unmanaged"})
-            entries.append({
-                "order_id": record["order_id"],
-                "return_id": record["return_id"],
-                "stage": record_stage,
-                "lines": lines,
-                "can_receive": record_stage == "pending" and not blockers,
-                "blockers": blockers,
-            })
+            entries.append(self._return_entry(record, record_stage, products, inventory))
         entries.sort(key=lambda item: item["return_id"])
         return entries
+
+    @staticmethod
+    def _return_entry(record, stage, products, inventory):
+        # Builds one return-worklist-shaped entry from a record and its stage
+        # (pending/received/cancelled): lines merge duplicate skus and sort, and
+        # only pending entries are checked against the current catalog and
+        # inventory (paused sales never block receiving). Shared by
+        # return_worklist and replenishment_report so the shape is identical.
+        quantities = {}
+        for line in record["lines"]:
+            quantities[line["sku"]] = quantities.get(line["sku"], 0) + line["quantity"]
+        lines = [{"sku": sku, "quantity": quantities[sku]} for sku in sorted(quantities)]
+        blockers = []
+        if stage == "pending":
+            for sku in sorted(quantities):
+                if sku not in products:
+                    blockers.append({"sku": sku, "reason": "unknown-product"})
+                elif sku not in inventory:
+                    blockers.append({"sku": sku, "reason": "unmanaged"})
+        return {
+            "order_id": record["order_id"],
+            "return_id": record["return_id"],
+            "stage": stage,
+            "lines": lines,
+            "can_receive": stage == "pending" and not blockers,
+            "blockers": blockers,
+        }
+
+    def replenishment_report(self):
+        # Read-only root-wide replenishment list: the still-unreserved demand of
+        # placed orders alongside pending returns that can come back into stock.
+        # Only managed products whose total unreserved demand is positive are
+        # listed; carts and non-placed orders contribute no demand, received and
+        # cancelled returns contribute no expected inbound stock, and amended
+        # returns count at their latest lines. The two shortfalls are advisory
+        # only -- this never restocks, receives or reserves anything, never
+        # writes or creates the directory and never consumes a sequence; missing
+        # legacy collections read as empty.
+        data = self._read()
+        orders = data.get("orders", {})
+        inventory = data.get("inventory", {})
+        all_reservations = data.get("reservations", {})
+        # Demand side, reservation-audit detail semantics: merge duplicate skus
+        # inside each placed order, read actual reservations from the current
+        # records (a missing record reads as zero), and keep only orders that
+        # still lack reservation for the sku. Unmanaged products never reserve
+        # and are excluded from the report entirely.
+        demand = {}  # sku -> {order_id: audit detail row}
+        for order in orders.values():
+            if order.get("status") != "placed":
+                continue
+            order_id = order["order_id"]
+            per_order = {}
+            for line in order.get("lines", ()):
+                per_order[line["sku"]] = per_order.get(line["sku"], 0) + line["quantity"]
+            for sku, quantity in per_order.items():
+                if sku not in inventory:
+                    continue
+                reserved = all_reservations.get(order_id, {}).get(sku, 0)
+                unreserved = max(0, quantity - reserved)
+                if unreserved <= 0:
+                    continue
+                demand.setdefault(sku, {})[order_id] = {
+                    "order_id": order_id,
+                    "quantity": quantity,
+                    "reserved": reserved,
+                    "unreserved": unreserved,
+                }
+        products = data.get("products", {})
+        candidates = sorted(
+            sku for sku, rows in demand.items()
+            if sum(row["unreserved"] for row in rows.values()) > 0
+        )
+        # Every listed product must still be in the catalog.
+        for sku in candidates:
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+        candidate_set = set(candidates)
+        # Inbound side: pending return-worklist entries (active registrations
+        # without a receipt; cancelled and received registrations never count).
+        # Only registrations that actually appear in the detail -- carrying at
+        # least one candidate sku -- are shown or validated: such a registration
+        # must still belong to an existing shipped/delivered order, otherwise the
+        # whole query is rejected instead of surfacing partial results.
+        receipts = data.get("return_receipts", {})
+        pending_records = [
+            record for records in data.get("returns", {}).values()
+            for record in records if record["return_id"] not in receipts
+        ]
+        returns_by_sku = {}  # sku -> {return_id: worklist entry}
+        pending_totals = {}
+        for record in pending_records:
+            skus = {line["sku"] for line in record["lines"]}
+            shown_skus = skus & candidate_set
+            if not shown_skus:
+                # The registration touches no listed product: it is not in any
+                # item's detail, so it is neither shown nor validated.
+                continue
+            order = orders.get(record["order_id"])
+            if order is None:
+                raise ValueError("unknown order: " + record["order_id"])
+            if order["status"] not in ("shipped", "delivered"):
+                raise ValueError("only a shipped order can be on the return worklist: " + record["order_id"])
+            entry = self._return_entry(record, "pending", products, inventory)
+            for sku in shown_skus:
+                returns_by_sku.setdefault(sku, {})[entry["return_id"]] = entry
+            if entry["can_receive"]:
+                # can_receive is registration-level: a registration that also
+                # carries an unknown or unmanaged product contributes nothing at
+                # all to pending; its lines and blocker reasons stay visible.
+                for sku in shown_skus:
+                    pending_totals[sku] = pending_totals.get(sku, 0) + sum(
+                        line["quantity"] for line in entry["lines"] if line["sku"] == sku
+                    )
+        report = []
+        for sku in candidates:
+            stock = self._stock_view(sku, inventory[sku])
+            needed = sum(row["unreserved"] for row in demand[sku].values())
+            available = stock["available"]
+            pending = pending_totals.get(sku, 0)
+            order_rows = [demand[sku][order_id] for order_id in sorted(demand[sku])]
+            return_rows = [
+                returns_by_sku[sku][return_id]
+                for return_id in sorted(returns_by_sku.get(sku, {}))
+            ]
+            report.append({
+                "sku": sku,
+                "stock": stock,
+                "needed": needed,
+                "pending": pending,
+                "shortfall": max(0, needed - available),
+                "projected_shortfall": max(0, needed - available - pending),
+                "orders": order_rows,
+                "returns": return_rows,
+            })
+        return report
+
 
     def history(self, order_id):
         order_id = text(order_id, "order_id")
