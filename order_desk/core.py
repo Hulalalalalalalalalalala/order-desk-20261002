@@ -1822,6 +1822,85 @@ class OrderDesk(JsonStore):
         return {"carrier": carrier, "tracking_no": tracking_no,
                 "orders": progress, "lines": lines}
 
+    def fulfillment_summary(self):
+        # Read-only root-wide fulfillment money summary: only orders whose
+        # current status is shipped or delivered count; carts and every other
+        # order never do. Shipped quantities equal ordered quantities (never
+        # stock deductions); active returns count at their latest lines, split
+        # into received (with a receipt) and pending (without), cancelled
+        # registrations excluded. Amounts use each order's stored deal price
+        # per line, never the current catalog price. Any included order whose
+        # line misses a deal price, carries a negative/non-integer/boolean
+        # price or inconsistent prices for one sku rejects the whole query. It
+        # never writes, never creates the directory and never consumes a
+        # sequence; missing legacy collections read as empty.
+        data = self._read()
+        orders = data.get("orders", {})
+        receipts = data.get("return_receipts", {})
+        selected = [order for order in orders.values()
+                    if order.get("status") in ("shipped", "delivered")]
+        totals = {}
+        order_count = 0
+        for order in selected:
+            order_id = order["order_id"]
+            order_count += 1
+            ordered = {}
+            deal_prices = {}
+            for line in order["lines"]:
+                sku = line["sku"]
+                ordered[sku] = ordered.get(sku, 0) + line["quantity"]
+                deal_prices.setdefault(sku, []).append(line.get("unit_price_cents"))
+            # Validate every deal price of every included order before any
+            # money is computed, so one bad legacy line rejects the whole
+            # summary instead of surfacing partial totals.
+            prices = {}
+            for sku, sku_prices in deal_prices.items():
+                unit_price = sku_prices[0]
+                if type(unit_price) is not int or unit_price < 0:
+                    raise ValueError("stored unit price is missing or invalid: " + sku)
+                if any(price != unit_price for price in sku_prices):
+                    raise ValueError("inconsistent unit prices in order: " + sku)
+                prices[sku] = unit_price
+            pending = {}
+            received = {}
+            for record in data.get("returns", {}).get(order_id, ()):
+                bucket = received if record["return_id"] in receipts else pending
+                for line in record["lines"]:
+                    bucket[line["sku"]] = bucket.get(line["sku"], 0) + line["quantity"]
+            for sku, quantity in ordered.items():
+                pending_qty = pending.get(sku, 0)
+                received_qty = received.get(sku, 0)
+                net_qty = quantity - received_qty
+                unit_price = prices[sku]
+                row = totals.setdefault(sku, {
+                    "shipped": 0, "pending": 0, "received": 0, "net": 0,
+                    "shipped_cents": 0, "pending_cents": 0,
+                    "received_cents": 0, "net_cents": 0,
+                })
+                row["shipped"] += quantity
+                row["pending"] += pending_qty
+                row["received"] += received_qty
+                row["net"] += net_qty
+                # Each order's quantities are priced at that order's stored
+                # deal price, so the same sku may add different cents across
+                # orders; the cross-order sum stays an integer.
+                row["shipped_cents"] += quantity * unit_price
+                row["pending_cents"] += pending_qty * unit_price
+                row["received_cents"] += received_qty * unit_price
+                row["net_cents"] += net_qty * unit_price
+        lines = []
+        summary_totals = {
+            "shipped": 0, "pending": 0, "received": 0, "net": 0,
+            "shipped_cents": 0, "pending_cents": 0,
+            "received_cents": 0, "net_cents": 0,
+        }
+        for sku in sorted(totals):
+            row = totals[sku]
+            lines.append({"sku": sku, **row})
+            for field in summary_totals:
+                summary_totals[field] += row[field]
+        return {"order_count": order_count, "lines": lines, "totals": summary_totals}
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
