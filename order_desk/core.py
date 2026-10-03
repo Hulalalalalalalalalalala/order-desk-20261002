@@ -234,6 +234,69 @@ class OrderDesk(JsonStore):
             raise ValueError("unknown stock count: " + count_id)
         return copy.deepcopy(record)
 
+    def reverse_stock_count(self, count_id):
+        # Whole-count reversal: every line of the original count is offset by
+        # subtracting its recorded delta from the CURRENT on_hand, so business
+        # that happened after the count (restocks, shipments, later counts) is
+        # preserved. Reservations and orders are never touched; availability is
+        # recomputed from the new on_hand. Paused products may be reversed, but
+        # a missing or unmanaged product, a negative result, or a result below
+        # the current reserved quantity rejects the whole reversal before
+        # anything is mutated, so a failure never writes the file, creates the
+        # data directory or consumes a history sequence.
+        count_id = text(count_id, "count_id")
+        data = self._read()
+        record = data.get("stock_counts", {}).get(count_id)
+        if record is None:
+            raise ValueError("unknown stock count: " + count_id)
+        if count_id in data.get("stock_count_reversals", {}):
+            raise ValueError("stock count already reversed: " + count_id)
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        # Validate every line and build the reversal snapshot before touching
+        # any inventory entry, so a rejected reversal leaves stock untouched.
+        result_lines = []
+        for line in sorted(record["lines"], key=lambda line: line["sku"]):
+            sku = line["sku"]
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            entry = inventory.get(sku)
+            if entry is None:
+                raise ValueError("product is not managed: " + sku)
+            delta = -line["delta"]
+            on_hand = entry["on_hand"] + delta
+            if on_hand < 0:
+                raise ValueError("reversal would make on_hand negative: " + sku)
+            if on_hand < entry["reserved"]:
+                raise ValueError("on_hand cannot be below reserved quantity: " + sku)
+            before = self._stock_view(sku, entry)
+            after = {"sku": sku, "on_hand": on_hand, "reserved": entry["reserved"],
+                     "available": on_hand - entry["reserved"]}
+            result_lines.append({"sku": sku, "delta": delta, "before": before, "after": after})
+        for line in result_lines:
+            inventory[line["sku"]]["on_hand"] = line["after"]["on_hand"]
+        for line in result_lines:
+            # A zero-delta line stays in the credential but is no stock change.
+            if line["delta"]:
+                self._record_stock_event(
+                    data, line["sku"], "reverse-stock-count", count_id, line["before"], line["after"]
+                )
+        result = {"count_id": count_id, "lines": result_lines}
+        # Even an all-zero reversal registers its credential; the original
+        # count snapshot is never rewritten and the count_id stays occupied.
+        data.setdefault("stock_count_reversals", {})[count_id] = copy.deepcopy(result)
+        self._write(data)
+        return result
+
+    def get_stock_count_reversal(self, count_id):
+        # Read-only: returns the credential stored at reversal time; legacy
+        # data without a reversals key simply reads as nothing reversed.
+        count_id = text(count_id, "count_id")
+        record = self._read().get("stock_count_reversals", {}).get(count_id)
+        if record is None:
+            raise ValueError("stock count has not been reversed: " + count_id)
+        return copy.deepcopy(record)
+
     def place(self, order_id, lines):
         order_id = text(order_id, "order_id")
         if not isinstance(lines, list) or not lines:
