@@ -1088,6 +1088,33 @@ class OrderDesk(JsonStore):
         tracking_no = text(value.get("tracking_no"), "tracking_no")
         return {"carrier": carrier, "tracking_no": tracking_no}
 
+    @staticmethod
+    def _match_shipment_orders(data, carrier, tracking_no):
+        # Orders whose CURRENT shipment matches carrier + tracking_no after both
+        # sides are trimmed (exact, case-sensitive): only shipped/delivered
+        # orders qualify, the ship/correct-shipment snapshots in history are
+        # never matched, and a legacy shipment that is missing, non-object or
+        # holds missing/non-string/blank text is skipped rather than repaired.
+        matched = []
+        for order in data.get("orders", {}).values():
+            if order.get("status") not in ("shipped", "delivered"):
+                continue
+            shipment = order.get("shipment")
+            if not isinstance(shipment, dict):
+                continue
+            current_carrier = shipment.get("carrier")
+            current_tracking = shipment.get("tracking_no")
+            if not isinstance(current_carrier, str) or not isinstance(current_tracking, str):
+                continue
+            current_carrier = current_carrier.strip()
+            current_tracking = current_tracking.strip()
+            if not current_carrier or not current_tracking:
+                continue
+            if current_carrier == carrier and current_tracking == tracking_no:
+                matched.append(order)
+        matched.sort(key=lambda order: order["order_id"])
+        return matched
+
     def correct_shipment(self, order_id, expected_shipment, shipment):
         # Correct a recorded shipment after checking the original info: only
         # shipped or delivered orders qualify, existing returns never block it,
@@ -1141,6 +1168,66 @@ class OrderDesk(JsonStore):
         self._record_event(data, order_id, "confirm-delivery", order, False)
         self._write(data)
         return order
+
+    @staticmethod
+    def _delivery_info(value):
+        # Normalizes a stored delivery object: it must be an object whose
+        # recipient is a nonempty trimmed string and whose delivered_on is a
+        # real YYYY-MM-DD calendar date. Raises ValueError for a missing,
+        # non-object or otherwise invalid stored delivery, so a unified
+        # confirm never silently overwrites an unreadable one.
+        if not isinstance(value, dict):
+            raise ValueError("delivery must be an object with recipient and delivered_on")
+        recipient = text(value.get("recipient"), "recipient")
+        delivered_on = calendar_date(value.get("delivered_on"), "delivered_on")
+        return {"recipient": recipient, "delivered_on": delivered_on}
+
+    def confirm_shipment_delivery(self, carrier, tracking_no, recipient, delivered_on):
+        # Sign for a whole shipment at once: every order currently shipped
+        # under the carrier + tracking_no combination (the current shipment
+        # matching rules from shipment_orders, never historical shipments) is
+        # delivered together using one recipient/date the caller supplies (the
+        # system clock is never read). An already delivered order on the same
+        # shipment is only accepted when its stored delivery normalizes to
+        # exactly the same recipient and date; any mismatch, or a missing,
+        # non-object or textually invalid stored delivery, rejects the whole
+        # request before any order is touched. It never changes lines, amounts,
+        # shipment, stock, reservations, carts or existing returns, and adds
+        # no stock events; returns never block signing.
+        carrier = text(carrier, "carrier")
+        tracking_no = text(tracking_no, "tracking_no")
+        recipient = text(recipient, "recipient")
+        delivered_on = calendar_date(delivered_on, "delivered_on")
+        requested = {"recipient": recipient, "delivered_on": delivered_on}
+        data = self._read()
+        matched = self._match_shipment_orders(data, carrier, tracking_no)
+        if not matched:
+            raise ValueError("no shipped orders match shipment " + carrier + " " + tracking_no)
+        # Validate every delivered match and collect the shipped orders before
+        # mutating anything, so a rejected request leaves orders, file and
+        # sequences byte-for-byte untouched and never creates the directory.
+        pending = []
+        for order in matched:
+            if order["status"] == "delivered":
+                if self._delivery_info(order.get("delivery")) != requested:
+                    raise ValueError(
+                        "order already delivered with different information: " + order["order_id"]
+                    )
+            else:
+                pending.append(order)
+        results = [self.get(order["order_id"]) for order in matched]
+        if not pending:
+            # Every match was already signed for with the same normalized
+            # information: still return the full result, but no file is written
+            # and no events are appended.
+            return {"carrier": carrier, "tracking_no": tracking_no, "orders": results}
+        for order in pending:
+            order["status"] = "delivered"
+            order["delivery"] = dict(requested)
+            self._record_event(data, order["order_id"], "confirm-delivery", order, False)
+        self._write(data)
+        return {"carrier": carrier, "tracking_no": tracking_no,
+                "orders": [self.get(order["order_id"]) for order in matched]}
 
     def pick_list(self, order_ids):
         # Read-only picking summary across the selected placed orders: it merges
@@ -1862,29 +1949,7 @@ class OrderDesk(JsonStore):
         carrier = text(carrier, "carrier")
         tracking_no = text(tracking_no, "tracking_no")
         data = self._read()
-        orders = data.get("orders", {})
-        matched = []
-        for order in orders.values():
-            if order.get("status") not in ("shipped", "delivered"):
-                continue
-            shipment = order.get("shipment")
-            # A missing or non-object shipment, or one whose required fields are
-            # missing, non-string or blank, simply cannot match: skip it rather
-            # than raising or fabricating info.
-            if not isinstance(shipment, dict):
-                continue
-            current_carrier = shipment.get("carrier")
-            current_tracking = shipment.get("tracking_no")
-            if not isinstance(current_carrier, str) or not isinstance(current_tracking, str):
-                continue
-            current_carrier = current_carrier.strip()
-            current_tracking = current_tracking.strip()
-            if not current_carrier or not current_tracking:
-                continue
-            if current_carrier != carrier or current_tracking != tracking_no:
-                continue
-            matched.append(order)
-        matched.sort(key=lambda order: order["order_id"])
+        matched = self._match_shipment_orders(data, carrier, tracking_no)
         progress = [self.order_progress(order["order_id"]) for order in matched]
         totals = {}
         for result in progress:
