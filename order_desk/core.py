@@ -603,6 +603,112 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def reduce_order(self, order_id, lines):
+        # Reduce a placed order's own lines while keeping the deal: unlike
+        # amend, remaining lines keep their original relative order, duplicate
+        # lines and deal unit prices, and paused sales, a missing catalog
+        # entry or short stock never block giving quantities back. Each
+        # requested sku is deducted from its last line backwards; zero
+        # quantity lines drop out, surviving duplicate lines stay separate,
+        # and subtotals are recomputed at the original deal price. Everything
+        # is validated before any mutation, so a rejected reduction leaves the
+        # file, reservations, history and sequences untouched and never
+        # creates the data directory.
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can be reduced")
+        # Check the merged reduction against the current deal lines: every
+        # requested sku must be ordered and its merged reduction must fit the
+        # merged ordered quantity; reducing the whole order is a cancellation.
+        ordered = {}
+        for line in order["lines"]:
+            ordered[line["sku"]] = ordered.get(line["sku"], 0) + line["quantity"]
+        for sku, quantity in requested.items():
+            if sku not in ordered:
+                raise ValueError("sku not in order: " + sku)
+            if quantity > ordered[sku]:
+                raise ValueError("reduced quantity exceeds ordered quantity: " + sku)
+        if sum(ordered.values()) == sum(requested.values()):
+            raise ValueError("reducing every line cancels the order; use cancel")
+        # Deduct from the last matching line backwards so earlier lines keep
+        # their quantities; zero-quantity rows are removed rather than stored.
+        to_deduct = dict(requested)
+        kept = []
+        for line in reversed(order["lines"]):
+            sku = line["sku"]
+            deduct = to_deduct.get(sku, 0)
+            quantity = line["quantity"]
+            if deduct:
+                take = min(deduct, quantity)
+                quantity -= take
+                to_deduct[sku] = deduct - take
+            kept.append((line, quantity))
+        kept.reverse()
+        items = []
+        for line, quantity in kept:
+            if not quantity:
+                continue
+            unit_price = line["unit_price_cents"]
+            items.append({
+                "sku": line["sku"],
+                "quantity": quantity,
+                "unit_price_cents": unit_price,
+                "subtotal_cents": quantity * unit_price,
+            })
+        remaining = {}
+        for item in items:
+            remaining[item["sku"]] = remaining.get(item["sku"], 0) + item["quantity"]
+        inventory = data.get("inventory", {})
+        own = data.get("reservations", {}).get(order_id, {})
+        # Each touched sku's reservation drops to the smaller of what this
+        # order actually holds and the remaining demand; only the difference
+        # is released, so the product total and availability move by the same
+        # amount while on_hand, other orders and untouched skus never change.
+        # Missing inventory or reservation records read as no reservation and
+        # are never auto-managed or backfilled.
+        releases = {}
+        for sku in sorted(requested):
+            entry = inventory.get(sku)
+            held = own.get(sku, 0)
+            if entry is None or not held:
+                continue
+            released = held - min(held, remaining.get(sku, 0))
+            if released:
+                releases[sku] = released
+        if releases:
+            record = data["reservations"][order_id]
+            for sku in sorted(releases):
+                entry = inventory[sku]
+                before = self._stock_view(sku, entry)
+                entry["reserved"] -= releases[sku]
+                self._record_stock_event(data, sku, "reduce-order", order_id, before, self._stock_view(sku, entry))
+                left = record[sku] - releases[sku]
+                if left:
+                    record[sku] = left
+                else:
+                    # Zeroed reservation attribution is removed.
+                    record.pop(sku, None)
+            if not record:
+                data["reservations"].pop(order_id, None)
+        order["lines"] = items
+        order["total_cents"] = sum(x["subtotal_cents"] for x in items)
+        self._record_event(data, order_id, "reduce-order", order, False)
+        self._write(data)
+        return order
+
     def reserve_order(self, order_id):
         # Top up reservations for a placed order whose products became managed
         # after it was placed. Deal lines, prices, amounts and status are never
