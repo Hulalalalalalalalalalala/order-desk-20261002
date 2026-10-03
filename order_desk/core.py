@@ -1822,6 +1822,72 @@ class OrderDesk(JsonStore):
         return {"carrier": carrier, "tracking_no": tracking_no,
                 "orders": progress, "lines": lines}
 
+    def fulfillment_summary(self):
+        # Read-only root-wide fulfillment money summary: only orders currently
+        # shipped or delivered count (carts and every other status never do).
+        # Shipped quantity is the ordered quantity, never stock deductions; an
+        # active return registration counts its latest lines as received when
+        # it holds a receipt and pending otherwise, cancelled registrations
+        # never count. Amounts multiply each order's quantities by that order's
+        # saved deal price and then sum across orders, never the catalog price.
+        # It never writes, never creates the data directory, and missing legacy
+        # orders/returns/receipts collections read as empty.
+        data = self._read()
+        receipts = data.get("return_receipts", {})
+        rows = {}
+        order_count = 0
+        for order in data.get("orders", {}).values():
+            if order.get("status") not in ("shipped", "delivered"):
+                continue
+            order_count += 1
+            # Merge duplicate sku lines inside the order while keeping every
+            # stored deal price for the consistency check below.
+            quantities = {}
+            deal_prices = {}
+            for line in order["lines"]:
+                sku = line["sku"]
+                quantities[sku] = quantities.get(sku, 0) + line["quantity"]
+                deal_prices.setdefault(sku, []).append(line.get("unit_price_cents"))
+            pending = {}
+            received = {}
+            for record in data.get("returns", {}).get(order["order_id"], ()):
+                # Active registrations only; amended records already carry
+                # their latest lines and cancelled ones live in another bucket.
+                bucket = received if record["return_id"] in receipts else pending
+                for line in record["lines"]:
+                    bucket[line["sku"]] = bucket.get(line["sku"], 0) + line["quantity"]
+            for sku, quantity in quantities.items():
+                prices = deal_prices[sku]
+                unit_price = prices[0]
+                if type(unit_price) is not int or unit_price < 0:
+                    raise ValueError("stored unit price is missing or invalid: " + sku)
+                if any(price != unit_price for price in prices):
+                    raise ValueError("inconsistent unit prices in order: " + sku)
+                pending_qty = pending.get(sku, 0)
+                received_qty = received.get(sku, 0)
+                net_qty = quantity - received_qty
+                row = rows.setdefault(sku, {
+                    "shipped": 0, "pending": 0, "received": 0, "net": 0,
+                    "shipped_cents": 0, "pending_cents": 0,
+                    "received_cents": 0, "net_cents": 0,
+                })
+                row["shipped"] += quantity
+                row["pending"] += pending_qty
+                row["received"] += received_qty
+                row["net"] += net_qty
+                row["shipped_cents"] += quantity * unit_price
+                row["pending_cents"] += pending_qty * unit_price
+                row["received_cents"] += received_qty * unit_price
+                row["net_cents"] += net_qty * unit_price
+        lines = [dict(sku=sku, **rows[sku]) for sku in sorted(rows)]
+        totals = {"shipped": 0, "pending": 0, "received": 0, "net": 0,
+                  "shipped_cents": 0, "pending_cents": 0,
+                  "received_cents": 0, "net_cents": 0}
+        for line in lines:
+            for key in totals:
+                totals[key] += line[key]
+        return {"order_count": order_count, "lines": lines, "totals": totals}
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
