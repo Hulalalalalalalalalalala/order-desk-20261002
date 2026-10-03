@@ -1659,6 +1659,68 @@ class OrderDesk(JsonStore):
             "events": copy.deepcopy(document["events"]),
         }
 
+    def order_progress(self, order_id):
+        # Read-only single-order fulfilment overview: it puts the reservation
+        # gap and the net quantity sent after return restocking on the same
+        # lines. Quantities come from the current order, the order's actual
+        # reservation record and the current return registrations/receipts --
+        # never from history or stock deduction. It never writes and never
+        # fabricates reservations, returns or receipts for legacy data.
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        ordered = {}
+        for line in order["lines"]:
+            ordered[line["sku"]] = ordered.get(line["sku"], 0) + line["quantity"]
+        managed = set(data.get("inventory", {}))
+        own = data.get("reservations", {}).get(order_id, {})
+        receipts = data.get("return_receipts", {})
+        # Active registrations count at their latest amended lines; cancelled
+        # records are excluded. A registration with a receipt is back in stock,
+        # one without is still waiting to come back.
+        pending = {}
+        received = {}
+        for record in data.get("returns", {}).get(order_id, []):
+            target = received if record["return_id"] in receipts else pending
+            for line in record["lines"]:
+                target[line["sku"]] = target.get(line["sku"], 0) + line["quantity"]
+        shipped_out = order["status"] in ("shipped", "delivered")
+        lines = []
+        for sku in sorted(ordered):
+            quantity = ordered[sku]
+            if order["status"] == "placed" and sku in managed:
+                reserved = own.get(sku, 0)
+                needed = max(0, quantity - reserved)
+            else:
+                # Unmanaged products need no reservation at all, and orders in
+                # any other status hold none regardless of stray records.
+                reserved = 0
+                needed = 0
+            pending_qty = pending.get(sku, 0)
+            received_qty = received.get(sku, 0)
+            if shipped_out:
+                remaining = quantity - pending_qty - received_qty
+            else:
+                remaining = 0
+            lines.append({
+                "sku": sku,
+                "ordered": quantity,
+                "reserved": reserved,
+                "needed": needed,
+                "shipped": quantity if shipped_out else 0,
+                "pending": pending_qty,
+                "received": received_qty,
+                "remaining": remaining,
+                "net": (quantity if shipped_out else 0) - received_qty,
+            })
+        return {
+            "order": copy.deepcopy(order),
+            "history": self.history(order_id),
+            "lines": lines,
+        }
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
