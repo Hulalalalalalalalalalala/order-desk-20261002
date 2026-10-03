@@ -450,6 +450,48 @@ class OrderDesk(JsonStore):
         self._write(data)
         return {"order": order, "cart": cart_view}
 
+    def checkout_cart_batch(self, checkouts):
+        # All-or-nothing batch checkout: every selected cart is settled in
+        # full into its own new order, or the whole request is rejected.
+        # Everything is validated and applied on one in-memory document with
+        # a single write at the end, so any failure -- including the last
+        # entry -- leaves the file, sequences and every cart untouched and
+        # never creates the data directory.
+        if not isinstance(checkouts, list) or not checkouts:
+            raise ValueError("checkouts must be a nonempty list")
+        entries = []
+        seen_carts = set()
+        seen_orders = set()
+        for item in checkouts:
+            if not isinstance(item, dict):
+                raise ValueError("each checkout must be an object with cart_id and order_id")
+            cart_id = text(item.get("cart_id"), "cart_id")
+            order_id = text(item.get("order_id"), "order_id")
+            if cart_id in seen_carts:
+                raise ValueError("duplicate cart_id: " + cart_id)
+            if order_id in seen_orders:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen_carts.add(cart_id)
+            seen_orders.add(order_id)
+            entries.append((cart_id, order_id))
+        data = self._read()
+        carts = data.get("carts", {})
+        orders = []
+        # Settle in input order so shared-product stock snapshots chain. Each
+        # _place prices against the current catalog and checks the
+        # availability left after every existing reservation plus the
+        # reservations the earlier entries of this batch just made, so the
+        # combined demand of several carts for one sku can never exceed that
+        # margin; unmanaged products stay unlimited and unreserved.
+        for cart_id, order_id in entries:
+            cart = carts.get(cart_id)
+            if cart is None:
+                raise ValueError("unknown cart: " + cart_id)
+            orders.append(self._place(data, order_id, copy.deepcopy(cart["lines"])))
+            carts.pop(cart_id, None)
+        self._write(data)
+        return sorted(orders, key=lambda order: order["order_id"])
+
     def amend(self, order_id, lines):
         order_id = text(order_id, "order_id")
         if not isinstance(lines, list) or not lines:
