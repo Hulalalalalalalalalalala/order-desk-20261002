@@ -1031,6 +1031,79 @@ class OrderDesk(JsonStore):
         self._write(data)
         return result
 
+    def merge_orders(self, source_id, target_id):
+        # Merge two placed orders into the target: the source keeps its id,
+        # lines and amounts but becomes cancelled, while the target keeps its
+        # id and placed status, appends the source's deal lines after its own
+        # (line order, duplicate skus, quantities, deal prices and subtotals
+        # preserved, never repriced against the catalog) and totals the two
+        # original amounts. Repricing, paused sales or a missing catalog entry
+        # never block a merge, and zero-price lines are kept. Per sku the
+        # source's actual reservations move to the target and the source's
+        # attribution is removed: on_hand, total reserved, availability and
+        # every other order's reservations never change, shortfalls are never
+        # topped up, unmanaged products are never auto-managed and read as
+        # zero reservation, and missing inventory/reservation collections or a
+        # missing own attribution read as empty. Everything is validated
+        # before any mutation, so a rejected merge leaves the file, sequences
+        # and every record untouched and never creates the data directory.
+        source_id = text(source_id, "source_id")
+        target_id = text(target_id, "target_id")
+        data = self._read()
+        orders = data.get("orders", {})
+        source = orders.get(source_id)
+        if source is None:
+            raise ValueError("unknown order: " + source_id)
+        target = orders.get(target_id)
+        if target is None:
+            raise ValueError("unknown order: " + target_id)
+        if source["status"] != "placed":
+            raise ValueError("only a placed order can be merged away: " + source_id)
+        if target["status"] != "placed":
+            raise ValueError("only a placed order can receive a merge: " + target_id)
+        if source_id == target_id:
+            raise ValueError("source and target must be different orders")
+        # Every stored deal price on both orders must be a nonnegative integer
+        # (booleans rejected), and one sku's rows must agree on a single deal
+        # price across the merged lines -- the catalog price is never
+        # consulted and no row is picked as a substitute.
+        merged_prices = {}
+        for order in (source, target):
+            for line in order["lines"]:
+                sku = line["sku"]
+                unit_price = line.get("unit_price_cents")
+                if type(unit_price) is not int or unit_price < 0:
+                    raise ValueError("stored unit price is missing or invalid: " + sku)
+                if sku in merged_prices and merged_prices[sku] != unit_price:
+                    raise ValueError("inconsistent unit prices in merged order: " + sku)
+                merged_prices[sku] = unit_price
+        # Move the source's actual reservations to the target per sku. Only
+        # managed products hold reservations; stray attribution for an
+        # unmanaged product reads as zero and disappears with the source's
+        # attribution. The total reserved per sku is unchanged, so no stock
+        # history is recorded.
+        inventory = data.get("inventory", {})
+        records = data.get("reservations", {})
+        source_held = records.pop(source_id, {})
+        moved = {}
+        for sku, quantity in source_held.items():
+            if sku in inventory and quantity:
+                moved[sku] = moved.get(sku, 0) + quantity
+        if moved:
+            target_record = data.setdefault("reservations", {}).setdefault(target_id, {})
+            for sku, quantity in moved.items():
+                target_record[sku] = target_record.get(sku, 0) + quantity
+        target["lines"] = target["lines"] + copy.deepcopy(source["lines"])
+        target["total_cents"] = target["total_cents"] + source["total_cents"]
+        source["status"] = "cancelled"
+        result = {"source": source, "target": target}
+        # Both orders keep the same full snapshot; each continues its own
+        # sequence and legacy orders start at 1 with complete=False.
+        self._record_event(data, source_id, "merge-orders", result, False)
+        self._record_event(data, target_id, "merge-orders", result, False)
+        self._write(data)
+        return result
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
