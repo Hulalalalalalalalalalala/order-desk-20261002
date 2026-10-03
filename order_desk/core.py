@@ -1005,6 +1005,57 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def reopen_order(self, order_id):
+        # Bring a cancelled order back into fulfillment under the same id: the
+        # stored deal lines, order, duplicate rows, quantities, deal prices,
+        # subtotals and total are preserved untouched (catalog reprice never
+        # reprices an order), while every line is re-checked against the
+        # current catalog and managed products are reserved for the full
+        # ordered quantity from the availability left after every existing
+        # reservation. Nothing is borrowed from other orders or from the
+        # pre-cancellation history; unmanaged products stay unlimited, are
+        # never auto-managed and get no reservation. Any rejection leaves the
+        # file, directory, reservations, history and sequences untouched.
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "cancelled":
+            raise ValueError("only a cancelled order can be reopened")
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        needed = {}
+        for line in order["lines"]:
+            sku = line["sku"]
+            product = products.get(sku)
+            if product is None:
+                raise ValueError("unknown product: " + sku)
+            if not self._is_enabled(product):
+                raise ValueError("product is not available for sale: " + sku)
+            needed[sku] = needed.get(sku, 0) + line["quantity"]
+        reservations = {}
+        for sku, quantity in needed.items():
+            entry = inventory.get(sku)
+            if entry is None:
+                # Unmanaged products stay unlimited and are never auto-managed.
+                continue
+            if quantity > entry["on_hand"] - entry["reserved"]:
+                raise ValueError("insufficient stock: " + sku)
+            reservations[sku] = quantity
+        if reservations:
+            inventory = data.setdefault("inventory", {})
+            for sku in sorted(reservations):
+                entry = inventory[sku]
+                before = self._stock_view(sku, entry)
+                entry["reserved"] += reservations[sku]
+                self._record_stock_event(data, sku, "reopen-order", order_id, before, self._stock_view(sku, entry))
+            data.setdefault("reservations", {})[order_id] = reservations
+        order["status"] = "placed"
+        self._record_event(data, order_id, "reopen-order", order, False)
+        self._write(data)
+        return order
+
     def _ship_order(self, data, order, carrier, tracking_no):
         # Shared mutation for ship and ship_batch: the caller has already
         # validated that the order is placed. Deducts only this order's actual
