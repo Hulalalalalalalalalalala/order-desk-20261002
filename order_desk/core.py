@@ -395,6 +395,61 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def checkout_cart_part(self, cart_id, order_id, lines):
+        # Partial checkout: only the selected quantities become a new order and
+        # the rest of the cart survives. The merged selection is checked
+        # against the cart's current quantities first, then against the current
+        # catalog and stock via _place; skus left behind -- paused, out of stock
+        # or missing from the catalog -- never block this checkout and keep
+        # their quantities. Everything happens on one in-memory document with a
+        # single write, so any failure leaves the file, sequences and the cart
+        # untouched.
+        cart_id = text(cart_id, "cart_id")
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        cart = data.get("carts", {}).get(cart_id)
+        if cart is None:
+            raise ValueError("unknown cart: " + cart_id)
+        current = {}
+        for line in cart["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        for sku, quantity in requested.items():
+            if sku not in current:
+                raise ValueError("sku not in cart: " + sku)
+            if quantity > current[sku]:
+                raise ValueError("selected quantity exceeds cart quantity: " + sku)
+        # _place prices and reserves against the current catalog and stock and
+        # records the place events; it validates everything before mutating.
+        order = self._place(
+            data, order_id,
+            [{"sku": sku, "quantity": requested[sku]} for sku in sorted(requested)],
+        )
+        remaining = []
+        for sku in sorted(current):
+            quantity = current[sku] - requested.get(sku, 0)
+            if quantity:
+                # Zero-quantity rows are removed rather than stored.
+                remaining.append({"sku": sku, "quantity": quantity})
+        carts = data.get("carts", {})
+        if remaining:
+            cart_view = {"cart_id": cart_id, "lines": remaining}
+            carts[cart_id] = cart_view
+        else:
+            # Selecting the whole cart settles it completely.
+            carts.pop(cart_id, None)
+            cart_view = None
+        self._write(data)
+        return {"order": order, "cart": cart_view}
+
     def amend(self, order_id, lines):
         order_id = text(order_id, "order_id")
         if not isinstance(lines, list) or not lines:
