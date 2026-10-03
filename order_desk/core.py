@@ -1772,6 +1772,56 @@ class OrderDesk(JsonStore):
             })
         return {"order": self.get(order_id), "history": self.history(order_id), "lines": lines}
 
+    def shipment_orders(self, carrier, tracking_no):
+        # Read-only lookup of every order currently shipped under a carrier +
+        # tracking number combination: only the order's current shipment object
+        # is matched, never the ship/correct-shipment snapshots in history, and
+        # only shipped or delivered orders qualify. Each match embeds the full
+        # order-progress result; the merged lines sum that view's fulfillment
+        # quantities. It never writes, never fabricates shipment info for legacy
+        # orders, and missing orders/history/returns/receipts collections read
+        # as empty.
+        carrier = text(carrier, "carrier")
+        tracking_no = text(tracking_no, "tracking_no")
+        data = self._read()
+        orders = data.get("orders", {})
+        matched = []
+        for order in orders.values():
+            if order.get("status") not in ("shipped", "delivered"):
+                continue
+            shipment = order.get("shipment")
+            # A missing or non-object shipment, or one whose required fields are
+            # missing, non-string or blank, simply cannot match: skip it rather
+            # than raising or fabricating info.
+            if not isinstance(shipment, dict):
+                continue
+            current_carrier = shipment.get("carrier")
+            current_tracking = shipment.get("tracking_no")
+            if not isinstance(current_carrier, str) or not isinstance(current_tracking, str):
+                continue
+            current_carrier = current_carrier.strip()
+            current_tracking = current_tracking.strip()
+            if not current_carrier or not current_tracking:
+                continue
+            if current_carrier != carrier or current_tracking != tracking_no:
+                continue
+            matched.append(order)
+        matched.sort(key=lambda order: order["order_id"])
+        progress = [self.order_progress(order["order_id"]) for order in matched]
+        totals = {}
+        for result in progress:
+            for line in result["lines"]:
+                row = totals.setdefault(line["sku"], {"shipped": 0, "pending": 0,
+                                                      "received": 0, "remaining": 0, "net": 0})
+                row["shipped"] += line["shipped"]
+                row["pending"] += line["pending"]
+                row["received"] += line["received"]
+                row["remaining"] += line["remaining"]
+                row["net"] += line["net"]
+        lines = [{"sku": sku, **totals[sku]} for sku in sorted(totals)]
+        return {"carrier": carrier, "tracking_no": tracking_no,
+                "orders": progress, "lines": lines}
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
