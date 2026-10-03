@@ -1772,6 +1772,50 @@ class OrderDesk(JsonStore):
             })
         return {"order": self.get(order_id), "history": self.history(order_id), "lines": lines}
 
+    def shipment_orders(self, carrier, tracking_no):
+        # Read-only lookup of orders by their CURRENT shipment info: both the
+        # query values and the stored carrier/tracking_no are trimmed and then
+        # matched exactly (case-sensitive). Only shipped or delivered orders
+        # qualify; a tracking number may be shared by any number of orders and
+        # every match is returned. It never writes, never fabricates shipment
+        # info for legacy orders, and never matches old shipment snapshots in
+        # history, so a corrected order moves to the new combination.
+        carrier = text(carrier, "carrier")
+        tracking_no = text(tracking_no, "tracking_no")
+        data = self._read()
+        matched = []
+        for order in data.get("orders", {}).values():
+            if order["status"] not in ("shipped", "delivered"):
+                continue
+            shipment = order.get("shipment")
+            if not isinstance(shipment, dict):
+                # Legacy orders without a usable shipment object are skipped,
+                # never repaired.
+                continue
+            stored_carrier = shipment.get("carrier")
+            stored_tracking = shipment.get("tracking_no")
+            if not isinstance(stored_carrier, str) or not stored_carrier.strip():
+                continue
+            if not isinstance(stored_tracking, str) or not stored_tracking.strip():
+                continue
+            if stored_carrier.strip() == carrier and stored_tracking.strip() == tracking_no:
+                matched.append(order["order_id"])
+        # Each entry is the full order-progress result for that order, so the
+        # per-order view is always identical to a standalone query.
+        orders = [self.order_progress(order_id) for order_id in sorted(matched)]
+        merged = {}
+        for progress in orders:
+            for line in progress["lines"]:
+                row = merged.setdefault(line["sku"], {
+                    "sku": line["sku"], "shipped": 0, "pending": 0,
+                    "received": 0, "remaining": 0, "net": 0,
+                })
+                for key in ("shipped", "pending", "received", "remaining", "net"):
+                    row[key] += line[key]
+        lines = [merged[sku] for sku in sorted(merged)]
+        return {"carrier": carrier, "tracking_no": tracking_no,
+                "orders": orders, "lines": lines}
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
