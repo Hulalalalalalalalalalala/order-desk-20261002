@@ -1235,6 +1235,83 @@ class OrderDesk(JsonStore):
                     return record["order_id"], record, True
         return None
 
+    @staticmethod
+    def _merged_return_lines(value, label):
+        # Normalizes a return line list: a nonempty list of objects each with a
+        # trimmed nonempty sku and a positive integer quantity (booleans
+        # rejected); extra fields are ignored and duplicate skus merge. Returns
+        # (merged, lines) where merged maps sku -> quantity and lines is the
+        # sorted sku/quantity list used for comparison, storage and results.
+        if not isinstance(value, list) or not value:
+            raise ValueError(label + " must be a nonempty list")
+        merged = {}
+        for line in value:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            merged[sku] = merged.get(sku, 0) + quantity
+        return merged, [{"sku": sku, "quantity": merged[sku]} for sku in sorted(merged)]
+
+    def amend_return(self, return_id, expected_lines, lines):
+        # Whole-registration correction of a pending return: the registration
+        # keeps its return_id and order, but its lines are replaced wholesale
+        # once the expected original content matches the current record. The
+        # new list may grow, shrink, drop or add skus as long as every sku
+        # belongs to the original order; paused sales, unmanaged stock and a
+        # missing catalog entry never block original-order products. The
+        # merged ordered quantity is the cap: the new quantity plus every
+        # other active registration of the same order (received ones included)
+        # must not exceed it, while this registration's old content and
+        # cancelled registrations occupy no allowance.
+        return_id = text(return_id, "return_id")
+        expected, _ = self._merged_return_lines(expected_lines, "expected_lines")
+        requested, after = self._merged_return_lines(lines, "lines")
+        data = self._read()
+        located = self._find_return(data, return_id)
+        if located is None:
+            raise ValueError("unknown return: " + return_id)
+        order_id, record, cancelled = located
+        if cancelled:
+            raise ValueError("return already cancelled: " + return_id)
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped order can amend a return: " + order_id)
+        if return_id in data.get("return_receipts", {}):
+            raise ValueError("return already received: " + return_id)
+        current = {}
+        for line in record["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        # The original content is always checked first, even when the target
+        # equals the current content.
+        if expected != current:
+            raise ValueError("expected lines do not match current lines")
+        ordered = {}
+        for line in order["lines"]:
+            ordered[line["sku"]] = ordered.get(line["sku"], 0) + line["quantity"]
+        others = {}
+        for other in data.get("returns", {}).get(order_id, []):
+            if other is record:
+                continue
+            for line in other["lines"]:
+                others[line["sku"]] = others.get(line["sku"], 0) + line["quantity"]
+        for sku, quantity in requested.items():
+            if sku not in ordered:
+                raise ValueError("sku not in original order: " + sku)
+            if others.get(sku, 0) + quantity > ordered[sku]:
+                raise ValueError("returned quantity exceeds ordered quantity: " + sku)
+        before = [{"sku": sku, "quantity": current[sku]} for sku in sorted(current)]
+        result = {"order_id": order_id, "return_id": return_id, "before": before, "after": after}
+        if after == before:
+            # Original content matched but the target changes nothing: still
+            # return the result, but no file is written and no event is
+            # appended.
+            return result
+        record["lines"] = after
+        self._record_event(data, order_id, "amend-return", result, False)
+        self._write(data)
+        return result
+
     def receive_return(self, return_id):
         return_id = text(return_id, "return_id")
         data = self._read()
