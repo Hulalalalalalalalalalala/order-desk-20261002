@@ -1221,6 +1221,94 @@ class OrderDesk(JsonStore):
         self._write(data)
         return result
 
+    @staticmethod
+    def _merge_return_lines(lines, label):
+        # Normalizes one return line list: a nonempty list of objects whose sku
+        # is a trimmed nonempty case-sensitive string and whose quantity is a
+        # positive integer (booleans rejected). Duplicate skus merge; extra line
+        # fields are ignored. Returns the merged lines sorted by sku.
+        if not isinstance(lines, list) or not lines:
+            raise ValueError(label + " must be a nonempty list")
+        merged = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            merged[sku] = merged.get(sku, 0) + quantity
+        return [{"sku": sku, "quantity": merged[sku]} for sku in sorted(merged)]
+
+    def amend_return(self, return_id, expected_lines, lines):
+        # Wholesale correction of a pending return registration: the expected
+        # list must match the current registration before the merged new list
+        # replaces it whole. The return id and its order stay the same; stock,
+        # reservations, the order itself and every other registration are never
+        # touched.
+        return_id = text(return_id, "return_id")
+        expected = self._merge_return_lines(expected_lines, "expected_lines")
+        requested = self._merge_return_lines(lines, "lines")
+        data = self._read()
+        located = self._find_return(data, return_id)
+        if located is None:
+            raise ValueError("unknown return: " + return_id)
+        order_id, record, cancelled = located
+        if cancelled:
+            raise ValueError("return already cancelled: " + return_id)
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped order can amend a return: " + order_id)
+        receipts = data.get("return_receipts", {})
+        if return_id in receipts:
+            raise ValueError("return already received: " + return_id)
+        # Merge the stored registration as well so legacy duplicate sku lines
+        # compare by merged quantity; only sku/quantity ever leave this method.
+        current = {}
+        for line in record["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        before = [{"sku": sku, "quantity": current[sku]} for sku in sorted(current)]
+        # The original content is always checked, even when the new list equals
+        # the current one; input line order never matters.
+        if expected != before:
+            raise ValueError("expected lines do not match current return")
+        ordered = {}
+        for line in order["lines"]:
+            ordered[line["sku"]] = ordered.get(line["sku"], 0) + line["quantity"]
+        # Quota per sku is the original ordered quantity; other pending
+        # registrations and already received returns of the same order occupy
+        # quota, while this registration's old quantities and cancelled
+        # registrations do not.
+        occupied = {}
+        for other in data.get("returns", {}).get(order_id, []):
+            if other["return_id"] == return_id or other["return_id"] in receipts:
+                continue
+            for line in other["lines"]:
+                occupied[line["sku"]] = occupied.get(line["sku"], 0) + line["quantity"]
+        for receipt in receipts.values():
+            if receipt["order_id"] != order_id or receipt["return_id"] == return_id:
+                continue
+            for line in receipt["lines"]:
+                occupied[line["sku"]] = occupied.get(line["sku"], 0) + line["quantity"]
+        for line in requested:
+            sku = line["sku"]
+            if sku not in ordered:
+                raise ValueError("sku not in original order: " + sku)
+            if occupied.get(sku, 0) + line["quantity"] > ordered[sku]:
+                raise ValueError("returned quantity exceeds ordered quantity: " + sku)
+        result = {
+            "order_id": order_id,
+            "return_id": return_id,
+            "before": copy.deepcopy(before),
+            "after": copy.deepcopy(requested),
+        }
+        if requested == before:
+            # Content unchanged after the original-list check: still return the
+            # snapshot, but no file is written and no event is appended.
+            return result
+        record["lines"] = copy.deepcopy(requested)
+        self._record_event(data, order_id, "amend-return", result, False)
+        self._write(data)
+        return result
+
     def _find_return(self, data, return_id):
         # Returns (order_id, record, cancelled) for both active and cancelled
         # registrations, so callers can tell an occupied-but-cancelled id from
