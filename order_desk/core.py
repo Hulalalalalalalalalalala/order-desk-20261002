@@ -306,9 +306,12 @@ class OrderDesk(JsonStore):
         return order
 
     def _place(self, data, order_id, lines):
-        # Shared by place and checkout_cart: validates against the current
-        # catalog and inventory inside `data`, reserves stock and records the
-        # place event. Caller writes `data` once everything has succeeded.
+        # Shared by place, single-cart checkout and batch checkout: validates
+        # against the current catalog and inventory inside `data`, reserves
+        # stock and records the place event. Caller writes `data` once the whole
+        # request has succeeded. In a batch the caller checks every cart and the
+        # combined managed demand before calling this, so sequential calls on
+        # the same document accumulate reservations and chain stock snapshots.
         if order_id in data.get("orders", {}):
             raise ValueError("order already exists")
         products = data.get("products", {})
@@ -449,6 +452,81 @@ class OrderDesk(JsonStore):
             cart_view = None
         self._write(data)
         return {"order": order, "cart": cart_view}
+
+    def checkout_cart_batch(self, checkouts):
+        # All-or-nothing batch checkout: every entry is normalized, every cart
+        # and target order id is checked, and every cart is priced against the
+        # current catalog before any order is created. Managed stock uses the
+        # margin left after every existing reservation; the combined demand of
+        # all carts for one sku must fit it, so a shortfall anywhere (including
+        # the last entry) rejects the whole request: carts, orders, inventory,
+        # history and sequences stay byte-for-byte untouched and the data
+        # directory is never created.
+        if not isinstance(checkouts, list) or not checkouts:
+            raise ValueError("checkouts must be a nonempty list")
+        entries = []
+        seen_carts = set()
+        seen_orders = set()
+        for item in checkouts:
+            if not isinstance(item, dict):
+                raise ValueError("each checkout must be an object with cart_id and order_id")
+            cart_id = text(item.get("cart_id"), "cart_id")
+            order_id = text(item.get("order_id"), "order_id")
+            if cart_id in seen_carts:
+                raise ValueError("duplicate cart_id: " + cart_id)
+            seen_carts.add(cart_id)
+            if order_id in seen_orders:
+                raise ValueError("duplicate order_id: " + order_id)
+            seen_orders.add(order_id)
+            entries.append((cart_id, order_id))
+        data = self._read()
+        carts = data.get("carts", {})
+        orders = data.get("orders", {})
+        products = data.get("products", {})
+        # Resolve every cart and target id and price every line against the
+        # current catalog before any mutation; merge the combined demand so a
+        # shared product is checked against the batch total.
+        planned = []
+        combined = {}
+        for cart_id, order_id in entries:
+            cart = carts.get(cart_id)
+            if cart is None:
+                raise ValueError("unknown cart: " + cart_id)
+            if order_id in orders:
+                raise ValueError("order already exists")
+            needed = {}
+            for line in cart["lines"]:
+                sku = line["sku"]
+                product = products.get(sku)
+                if product is None:
+                    raise ValueError("unknown product: " + sku)
+                if not self._is_enabled(product):
+                    raise ValueError("product is not available for sale: " + sku)
+                needed[sku] = needed.get(sku, 0) + line["quantity"]
+            planned.append((cart_id, order_id, needed))
+            for sku, quantity in needed.items():
+                combined[sku] = combined.get(sku, 0) + quantity
+        inventory = data.get("inventory", {})
+        # Unmanaged products never constrain the batch; managed demand must fit
+        # the availability left after every existing reservation.
+        for sku in sorted(combined):
+            entry = inventory.get(sku)
+            if entry is not None and combined[sku] > entry["on_hand"] - entry["reserved"]:
+                raise ValueError("insufficient stock: " + sku)
+        # All checks passed: place in request order on the same in-memory
+        # document. Each _place reserves against the reservations earlier
+        # checkouts in this batch just added, so shared-product stock snapshots
+        # chain; the combined check above guarantees none of them can fail.
+        created = []
+        for cart_id, order_id, needed in planned:
+            order = self._place(
+                data, order_id,
+                [{"sku": sku, "quantity": needed[sku]} for sku in sorted(needed)],
+            )
+            created.append(order)
+            carts.pop(cart_id, None)
+        self._write(data)
+        return sorted(created, key=lambda order: order["order_id"])
 
     def amend(self, order_id, lines):
         order_id = text(order_id, "order_id")
