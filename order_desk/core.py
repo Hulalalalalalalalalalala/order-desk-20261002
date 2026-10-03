@@ -1762,6 +1762,75 @@ class OrderDesk(JsonStore):
             raise ValueError("return has not been received: " + return_id)
         return copy.deepcopy(receipt)
 
+    def cancel_received_return(self, return_id):
+        # Whole-reversal of an already received return: every product's current
+        # on_hand is reduced by the quantity the original receipt added, so
+        # restocks, shipments and stock counts after the receive are preserved.
+        # Available drops by the same amount; reserved and every order's
+        # reservation records are never touched. The registration becomes
+        # cancelled (freeing returnable quantity) but its id stays occupied
+        # for the whole root, the original receipt stays queryable, and order
+        # status, deal lines, amounts, shipment and delivery are preserved.
+        # Paused sales never block the reversal; no refund happens.
+        return_id = text(return_id, "return_id")
+        data = self._read()
+        located = self._find_return(data, return_id)
+        if located is None:
+            raise ValueError("unknown return: " + return_id)
+        order_id, record, cancelled = located
+        if cancelled:
+            raise ValueError("return already cancelled: " + return_id)
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped order can cancel a received return: " + order_id)
+        receipt = data.get("return_receipts", {}).get(return_id)
+        if receipt is None:
+            # Legacy registrations without a receipt read as not received.
+            raise ValueError("return has not been received: " + return_id)
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        quantities = {}
+        for line in receipt["lines"]:
+            quantities[line["sku"]] = quantities.get(line["sku"], 0) + line["quantity"]
+        # Validate every product and every resulting on_hand against the
+        # current stock before touching any inventory entry, so a rejected
+        # reversal leaves stock, returns, receipts, history and sequences
+        # untouched and never creates the data directory.
+        result_lines = []
+        for sku in sorted(quantities):
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+            entry = inventory.get(sku)
+            if entry is None:
+                raise ValueError("product is not managed: " + sku)
+            quantity = quantities[sku]
+            on_hand = entry["on_hand"] - quantity
+            if on_hand < 0:
+                raise ValueError("reversed on_hand cannot be negative: " + sku)
+            reserved = entry["reserved"]
+            if on_hand < reserved:
+                raise ValueError("reversed on_hand cannot be below reserved quantity: " + sku)
+            result_lines.append({
+                "sku": sku,
+                "quantity": quantity,
+                "before": self._stock_view(sku, entry),
+                "after": {"sku": sku, "on_hand": on_hand, "reserved": reserved, "available": on_hand - reserved},
+            })
+        for line in result_lines:
+            inventory[line["sku"]]["on_hand"] = line["after"]["on_hand"]
+            self._record_stock_event(
+                data, line["sku"], "cancel-received-return", return_id, line["before"], line["after"]
+            )
+        result = {"order_id": order_id, "return_id": return_id, "lines": result_lines}
+        records = data["returns"][order_id]
+        records.remove(record)
+        if not records:
+            del data["returns"][order_id]
+        data.setdefault("cancelled_returns", {}).setdefault(order_id, []).append(copy.deepcopy(record))
+        self._record_event(data, order_id, "cancel-received-return", result, False)
+        self._write(data)
+        return result
+
     def return_worklist(self, stage="pending", order_id=None):
         # Read-only cross-order worklist: active registrations read as pending
         # unless they hold a receipt (received), cancelled registrations read as
