@@ -2158,6 +2158,114 @@ class OrderDesk(JsonStore):
                 summary_totals[field] += row[field]
         return {"order_count": order_count, "lines": lines, "totals": summary_totals}
 
+    def replenishment_report(self):
+        # Read-only root-wide replenishment list: per managed sku it merges the
+        # reservation demand placed orders still lack with the pending returns
+        # that could be received back into stock. Carts, non-placed orders and
+        # unmanaged products never contribute demand; received or cancelled
+        # returns never contribute projected restock. It never writes, never
+        # creates the directory, never consumes a sequence, and never performs
+        # a restock, reservation or receive -- the two shortfalls are advisory.
+        data = self._read()
+        orders = data.get("orders", {})
+        products = data.get("products", {})
+        inventory = data.get("inventory", {})
+        all_reservations = data.get("reservations", {})
+        # Duplicate skus in an order merge first; actual reservations come from
+        # the current attribution records (missing records read zero). Only
+        # managed skus and orders still short of reservation are kept.
+        demand = {}  # sku -> reservation-audit-style order rows
+        for order_id in sorted(orders):
+            order = orders[order_id]
+            if order["status"] != "placed":
+                continue
+            merged = {}
+            for line in order["lines"]:
+                merged[line["sku"]] = merged.get(line["sku"], 0) + line["quantity"]
+            own = all_reservations.get(order_id, {})
+            for sku, quantity in merged.items():
+                if sku not in inventory:
+                    continue
+                reserved = own.get(sku, 0)
+                unreserved = max(0, quantity - reserved)
+                if unreserved <= 0:
+                    continue
+                demand.setdefault(sku, []).append({
+                    "order_id": order_id,
+                    "quantity": quantity,
+                    "reserved": reserved,
+                    "unreserved": unreserved,
+                })
+        # A listed product is managed by definition, so a legacy inventory
+        # record without a catalog entry rejects the whole query.
+        for sku in sorted(demand):
+            if sku not in products:
+                raise ValueError("unknown product: " + sku)
+        included = set(demand)
+        # Pending returns reuse the return-worklist pending entry shape. A
+        # registration is attached to every included sku its latest lines
+        # touch; blocked registrations stay visible but contribute no pending
+        # quantity for any sku (the whole registration is excluded).
+        entries_by_sku = {sku: [] for sku in included}
+        pending_qty = {sku: 0 for sku in included}
+        receipts = data.get("return_receipts", {})
+        for records in data.get("returns", {}).values():
+            for record in records:
+                if record["return_id"] in receipts:
+                    continue
+                quantities = {}
+                for line in record["lines"]:
+                    quantities[line["sku"]] = quantities.get(line["sku"], 0) + line["quantity"]
+                touched = sorted(sku for sku in quantities if sku in included)
+                if not touched:
+                    continue
+                order = orders.get(record["order_id"])
+                if order is None or order["status"] not in ("shipped", "delivered"):
+                    if order is None:
+                        raise ValueError("unknown order: " + record["order_id"])
+                    raise ValueError(
+                        "only a shipped or delivered order can back a return: " + record["order_id"]
+                    )
+                blockers = []
+                for sku in sorted(quantities):
+                    if sku not in products:
+                        blockers.append({"sku": sku, "reason": "unknown-product"})
+                    elif sku not in inventory:
+                        blockers.append({"sku": sku, "reason": "unmanaged"})
+                entry = {
+                    "order_id": record["order_id"],
+                    "return_id": record["return_id"],
+                    "stage": "pending",
+                    "lines": [{"sku": sku, "quantity": quantities[sku]} for sku in sorted(quantities)],
+                    "can_receive": not blockers,
+                    "blockers": blockers,
+                }
+                for sku in touched:
+                    entries_by_sku[sku].append(entry)
+                    if entry["can_receive"]:
+                        pending_qty[sku] += quantities[sku]
+        report = []
+        for sku in sorted(included):
+            rows = sorted(demand[sku], key=lambda row: row["order_id"])
+            needed = sum(row["unreserved"] for row in rows)
+            returns = sorted(entries_by_sku[sku], key=lambda entry: entry["return_id"])
+            # Reuse the stock query itself so the embedded view is always
+            # identical to a standalone stock call.
+            stock = self.stock(sku)
+            available = stock["available"]
+            pending = pending_qty[sku]
+            report.append({
+                "sku": sku,
+                "stock": stock,
+                "needed": needed,
+                "pending": pending,
+                "shortfall": max(0, needed - available),
+                "projected_shortfall": max(0, needed - available - pending),
+                "orders": rows,
+                "returns": returns,
+            })
+        return report
+
     def order_worklist(self, stage="open"):
         # Read-only cross-order fulfillment worklist: every order's open tasks
         # (reserve top-up, ship, deliver, receive-return) derived from its
