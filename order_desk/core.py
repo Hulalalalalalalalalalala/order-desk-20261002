@@ -1169,6 +1169,66 @@ class OrderDesk(JsonStore):
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
 
+    def quote_return(self, order_id, lines):
+        # Read-only return preview: amounts come from the order's stored deal
+        # prices, never the catalog, and paused sales, missing stock, unmanaged
+        # or catalog-less products never block original-order items. It never
+        # writes, never creates the data directory, never occupies return
+        # allowance, and a later record_return still validates against the
+        # data current at that time.
+        order_id = text(order_id, "order_id")
+        requested, _ = self._merged_return_lines(lines, "lines")
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped or delivered order can quote a return")
+        ordered = {}
+        deal_prices = {}
+        for line in order["lines"]:
+            sku = line["sku"]
+            ordered[sku] = ordered.get(sku, 0) + line["quantity"]
+            deal_prices.setdefault(sku, []).append(line.get("unit_price_cents"))
+        # Active registrations occupy allowance, received ones included;
+        # cancelled records free it and amended records count at their latest
+        # quantities. Legacy data without any returns reads as nothing
+        # returned and is never backfilled.
+        returned = {}
+        for record in data.get("returns", {}).get(order_id, []):
+            for line in record["lines"]:
+                returned[line["sku"]] = returned.get(line["sku"], 0) + line["quantity"]
+        result_lines = []
+        can_record = True
+        for sku in sorted(requested):
+            if sku not in ordered:
+                raise ValueError("sku not in original order: " + sku)
+            prices = deal_prices[sku]
+            unit_price = prices[0]
+            if type(unit_price) is not int or unit_price < 0:
+                raise ValueError("stored unit price is missing or invalid: " + sku)
+            if any(price != unit_price for price in prices):
+                raise ValueError("inconsistent unit prices in order: " + sku)
+            quantity = requested[sku]
+            remaining = ordered[sku] - returned.get(sku, 0)
+            if quantity > remaining:
+                # Over-quantity is reported, not truncated: the full requested
+                # amount is still priced.
+                can_record = False
+            result_lines.append({
+                "sku": sku,
+                "quantity": quantity,
+                "unit_price_cents": unit_price,
+                "subtotal_cents": quantity * unit_price,
+                "remaining": remaining,
+            })
+        return {
+            "order_id": order_id,
+            "lines": result_lines,
+            "total_cents": sum(line["subtotal_cents"] for line in result_lines),
+            "can_record": can_record,
+        }
+
     def record_return(self, order_id, return_id, lines):
         order_id = text(order_id, "order_id")
         return_id = text(return_id, "return_id")
