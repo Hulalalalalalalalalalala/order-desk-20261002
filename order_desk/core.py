@@ -1104,6 +1104,156 @@ class OrderDesk(JsonStore):
         self._write(data)
         return result
 
+    def split_order(self, source_id, target_id, lines):
+        # Split part of a placed order into a new order while keeping the
+        # deal: the source keeps its id and placed status with the remaining
+        # quantities, and the target is a new placed order under a fresh id
+        # (a cart with the same name never blocks it) that receives the moved
+        # quantities. For each sku the moved quantity is taken from the LAST
+        # row backwards; both sides keep the original relative row order and
+        # per-row deal unit prices, zero-quantity rows are removed, surviving
+        # duplicate rows are never merged and zero-price rows are kept.
+        # Subtotals are recomputed at the preserved prices, totals stay
+        # integer cents and the two totals sum to the original total. Paused
+        # sales, catalog-less products, repricing and low available stock
+        # never block a split. Per involved managed sku the source keeps
+        # min(old actual reservation, remaining ordered quantity) and the
+        # difference moves to the target: on_hand, total reserved,
+        # availability and every other order's reservations never change and
+        # shortfalls are never topped up. Missing inventory or reservation
+        # records read as no reservation (never auto-managed). Everything is
+        # validated before any mutation, so a rejected split leaves the file,
+        # sequences and every record untouched and never creates the data
+        # directory.
+        source_id = text(source_id, "source_id")
+        target_id = text(target_id, "target_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested[sku] = requested.get(sku, 0) + quantity
+        data = self._read()
+        orders = data.get("orders", {})
+        source = orders.get(source_id)
+        if source is None:
+            raise ValueError("unknown order: " + source_id)
+        if source["status"] != "placed":
+            raise ValueError("only a placed order can be split")
+        if target_id == source_id:
+            raise ValueError("source and target must be different orders")
+        if target_id in orders:
+            raise ValueError("order already exists")
+        current = {}
+        for line in source["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        remaining_total = {}
+        for sku, quantity in requested.items():
+            if sku not in current:
+                raise ValueError("sku not in order: " + sku)
+            if quantity > current[sku]:
+                raise ValueError("split quantity exceeds ordered quantity: " + sku)
+            remaining_total[sku] = current[sku] - quantity
+        # Moving every line away is a cancellation and is rejected here.
+        if sum(current[sku] - requested.get(sku, 0) for sku in current) == 0:
+            raise ValueError("cannot split the whole order; cancel it instead")
+        # Every stored deal price on the source must be a nonnegative integer
+        # (booleans rejected) and one sku's rows must agree on a single deal
+        # price -- the catalog price is never consulted and no row is picked
+        # as a substitute.
+        prices = {}
+        for line in source["lines"]:
+            sku = line["sku"]
+            unit_price = line.get("unit_price_cents")
+            if type(unit_price) is not int or unit_price < 0:
+                raise ValueError("stored unit price is missing or invalid: " + sku)
+            if sku in prices and prices[sku] != unit_price:
+                raise ValueError("inconsistent unit prices in order: " + sku)
+            prices[sku] = unit_price
+        # Take each sku's moved quantity from its last row first by walking
+        # the rows backwards, then restore the original relative order on both
+        # sides. Deal unit prices travel with their rows and subtotals are
+        # recomputed at them; zero-quantity rows disappear and surviving
+        # duplicates stay split.
+        deduct = dict(requested)
+        removed_per_row = []
+        for line in reversed(source["lines"]):
+            sku = line["sku"]
+            removed = min(line["quantity"], deduct.get(sku, 0))
+            deduct[sku] = deduct.get(sku, 0) - removed
+            removed_per_row.append(removed)
+        removed_per_row.reverse()
+        source_items = []
+        target_items = []
+        for line, removed in zip(source["lines"], removed_per_row):
+            unit_price = line["unit_price_cents"]
+            remaining = line["quantity"] - removed
+            if remaining:
+                source_items.append({
+                    "sku": line["sku"],
+                    "quantity": remaining,
+                    "unit_price_cents": unit_price,
+                    "subtotal_cents": remaining * unit_price,
+                })
+            if removed:
+                target_items.append({
+                    "sku": line["sku"],
+                    "quantity": removed,
+                    "unit_price_cents": unit_price,
+                    "subtotal_cents": removed * unit_price,
+                })
+        # Split the source's actual reservations for the involved managed
+        # skus: the source keeps min(old, remaining ordered quantity) and the
+        # difference moves to the target. Only managed products hold
+        # reservations; a missing inventory record reads as no reservation
+        # even if a stray attribution key exists. The total reserved per sku
+        # is unchanged, so no stock history is recorded.
+        inventory = data.get("inventory", {})
+        records = data.get("reservations", {})
+        own = records.get(source_id, {})
+        plan = []
+        for sku in requested:
+            if sku not in inventory:
+                continue
+            old = own.get(sku, 0)
+            kept = min(old, remaining_total[sku])
+            if kept != old:
+                plan.append((sku, kept, old - kept))
+        source_record = records.get(source_id)
+        moved = {}
+        for sku, kept, difference in sorted(plan):
+            if kept:
+                source_record[sku] = kept
+            else:
+                source_record.pop(sku, None)
+            moved[sku] = difference
+        if source_record is not None and not source_record:
+            # The source held no other reservations: drop its attribution.
+            records.pop(source_id, None)
+        if moved:
+            target_record = data.setdefault("reservations", {}).setdefault(target_id, {})
+            target_record.update(moved)
+        source["lines"] = source_items
+        source["total_cents"] = sum(x["subtotal_cents"] for x in source_items)
+        target = {
+            "order_id": target_id,
+            "status": "placed",
+            "lines": target_items,
+            "total_cents": sum(x["subtotal_cents"] for x in target_items),
+        }
+        orders[target_id] = target
+        result = {"source": source, "target": target}
+        # Both orders keep the same full snapshot; the source continues its
+        # own sequence (legacy orders start at 1 with complete=False) and the
+        # new order starts a complete history at 1.
+        self._record_event(data, source_id, "split-order", result, False)
+        self._record_event(data, target_id, "split-order", result, True)
+        self._write(data)
+        return result
+
     def quote(self, lines):
         # Preview only: validate and price against current data, never write.
         if not isinstance(lines, list) or not lines:
