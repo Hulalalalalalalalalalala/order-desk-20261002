@@ -1117,6 +1117,55 @@ class OrderDesk(JsonStore):
             })
         return results
 
+    def reservation_audit(self, sku):
+        # Read-only per-product reconciliation: the stock view's reserved total
+        # versus the reservations actually held by the placed orders whose
+        # current lines contain the sku. It never writes, never fabricates
+        # reservations from deal content or history, and never corrects a
+        # mismatch -- a legacy gap is reported as the actual difference.
+        sku = text(sku, "sku")
+        data = self._read()
+        if sku not in data.get("products", {}):
+            raise ValueError("unknown product: " + sku)
+        # Reuse the stock query itself so the embedded view is always identical
+        # to a standalone stock call, including the unmanaged null semantics.
+        stock = self.stock(sku)
+        managed = sku in data.get("inventory", {})
+        rows = []
+        allocated = 0
+        for order in data.get("orders", {}).values():
+            if order["status"] != "placed":
+                continue
+            quantity = 0
+            for line in order["lines"]:
+                if line["sku"] == sku:
+                    quantity += line["quantity"]
+            if not quantity:
+                continue
+            order_id = order["order_id"]
+            if managed:
+                reserved = data.get("reservations", {}).get(order_id, {}).get(sku, 0)
+            else:
+                # Unmanaged products (including legacy data without inventory
+                # records) hold no reservations, regardless of stray records.
+                reserved = 0
+            rows.append({
+                "order_id": order_id,
+                "quantity": quantity,
+                "reserved": reserved,
+                "unreserved": max(0, quantity - reserved),
+            })
+            allocated += reserved
+        rows.sort(key=lambda row: row["order_id"])
+        # Keep the sign: positive means stock holds reservations not detailed
+        # by the displayed orders, negative means the details exceed the books.
+        return {
+            "stock": stock,
+            "allocated": allocated,
+            "difference": stock["reserved"] - allocated,
+            "orders": rows,
+        }
+
     def list_orders(self):
         return sorted(self._read().get("orders", {}).values(), key=lambda x: x["order_id"])
 
