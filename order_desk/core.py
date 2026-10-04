@@ -603,6 +603,81 @@ class OrderDesk(JsonStore):
         self._write(data)
         return order
 
+    def quote_amend(self, order_id, lines):
+        # Read-only amend preview for a placed order: the replacement list is
+        # normalized and validated exactly like amend (same line format, same
+        # catalog and paused-product rules against the order's current merged
+        # quantities) and every line is priced against the current catalog,
+        # but nothing is written -- no file, no directory, no history event,
+        # no sequence, and neither prices nor stock are locked in. A later
+        # amend re-validates everything against the data at submission time.
+        # Instead of rejecting on insufficient stock like amend, the preview
+        # reports the per-sku shortfall and flips can_amend to false.
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = []
+        needed = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested.append((sku, quantity))
+            needed[sku] = needed.get(sku, 0) + quantity
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can be amended")
+        # Paused products may stay in an order, shrink or disappear, but no new
+        # paused SKU can be added and its merged total may never grow. Compare
+        # current ordered quantities against the merged new list.
+        current = {}
+        for line in order["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        products = data.get("products", {})
+        items = []
+        for sku, quantity in requested:
+            product = products.get(sku)
+            if product is None:
+                raise ValueError("unknown product: " + sku)
+            if not self._is_enabled(product) and (
+                sku not in current or needed[sku] > current[sku]
+            ):
+                raise ValueError("product is not available for sale: " + sku)
+            items.append({"sku": sku, "quantity": quantity, "unit_price_cents": product["price_cents"], "subtotal_cents": quantity * product["price_cents"]})
+        inventory = data.get("inventory", {})
+        own = data.get("reservations", {}).get(order_id, {})
+        # Stock preview per merged sku: new demand may use what is available
+        # plus what this order already holds; a missing reservation record
+        # reads as zero and unmanaged products stay unlimited. Legacy data
+        # missing inventory or reservation records is read as-is, never
+        # backfilled.
+        stock_lines = []
+        can_amend = True
+        for sku in sorted(needed):
+            entry = inventory.get(sku)
+            if entry is None:
+                stock_lines.append({"sku": sku, "quantity": needed[sku], "own_reserved": 0,
+                                    "available": None, "shortfall": 0})
+                continue
+            own_reserved = own.get(sku, 0)
+            available = entry["on_hand"] - entry["reserved"]
+            shortfall = max(0, needed[sku] - available - own_reserved)
+            if shortfall:
+                can_amend = False
+            stock_lines.append({"sku": sku, "quantity": needed[sku], "own_reserved": own_reserved,
+                                "available": available, "shortfall": shortfall})
+        return {
+            "order_id": order_id,
+            "lines": items,
+            "total_cents": sum(x["subtotal_cents"] for x in items),
+            "stock": stock_lines,
+            "can_amend": can_amend,
+        }
+
     def reduce_order(self, order_id, lines):
         # Reduce a placed order while keeping the deal: surviving rows keep
         # their original relative order and per-row deal unit prices; for each
