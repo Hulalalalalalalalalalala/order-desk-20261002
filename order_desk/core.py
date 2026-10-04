@@ -1302,6 +1302,78 @@ class OrderDesk(JsonStore):
             "can_place": can_place,
         }
 
+    def quote_amend(self, order_id, lines):
+        # Read-only amend preview for a placed order: validate the replacement
+        # list and price it against the current catalog and stock, then report
+        # the new amounts and per-sku shortfalls without writing anything. A
+        # later amend re-validates everything at its own submission time.
+        order_id = text(order_id, "order_id")
+        if not isinstance(lines, list) or not lines:
+            raise ValueError("lines must be a nonempty list")
+        requested = []
+        needed = {}
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError("each line must be an object with sku and quantity")
+            sku = text(line.get("sku"), "sku")
+            quantity = positive(line.get("quantity"), "quantity")
+            requested.append((sku, quantity))
+            needed[sku] = needed.get(sku, 0) + quantity
+        data = self._read()
+        order = data.get("orders", {}).get(order_id)
+        if order is None:
+            raise ValueError("unknown order: " + order_id)
+        if order["status"] != "placed":
+            raise ValueError("only a placed order can be amended")
+        # Same paused-product rule as amend: a paused sku may stay, shrink or
+        # disappear, but no new paused sku and no growth of its merged total;
+        # the comparison uses the order's current merged ordered quantities.
+        current = {}
+        for line in order["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        products = data.get("products", {})
+        items = []
+        for sku, quantity in requested:
+            product = products.get(sku)
+            if product is None:
+                raise ValueError("unknown product: " + sku)
+            if not self._is_enabled(product) and (
+                sku not in current or needed[sku] > current[sku]
+            ):
+                raise ValueError("product is not available for sale: " + sku)
+            items.append({"sku": sku, "quantity": quantity, "unit_price_cents": product["price_cents"], "subtotal_cents": quantity * product["price_cents"]})
+        inventory = data.get("inventory", {})
+        own = data.get("reservations", {}).get(order_id, {})
+        # New demand may use what is available plus what this order actually
+        # holds; a missing reservation record reads as zero. Unmanaged products
+        # stay unlimited: no reservation, no shortfall, available is None.
+        stock_lines = []
+        can_amend = True
+        for sku in sorted(needed):
+            entry = inventory.get(sku)
+            if entry is None:
+                stock_lines.append({
+                    "sku": sku, "quantity": needed[sku],
+                    "own_reserved": 0, "available": None, "shortfall": 0,
+                })
+                continue
+            available = entry["on_hand"] - entry["reserved"]
+            own_reserved = own.get(sku, 0)
+            shortfall = max(0, needed[sku] - available - own_reserved)
+            if shortfall:
+                can_amend = False
+            stock_lines.append({
+                "sku": sku, "quantity": needed[sku],
+                "own_reserved": own_reserved, "available": available, "shortfall": shortfall,
+            })
+        return {
+            "order_id": order_id,
+            "lines": items,
+            "total_cents": sum(x["subtotal_cents"] for x in items),
+            "stock": stock_lines,
+            "can_amend": can_amend,
+        }
+
     def get(self, order_id):
         try:
             return self._read().get("orders", {})[order_id]
