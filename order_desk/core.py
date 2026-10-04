@@ -2841,6 +2841,87 @@ class OrderDesk(JsonStore):
                 entries.append({"order_id": order_id, "tasks": tasks, "progress": progress})
         return entries
 
+    def shipment_worklist(self, stage="open"):
+        # Read-only shipment sign-off reconciliation: orders currently shipped
+        # or delivered are grouped by their CURRENT carrier + tracking number
+        # combination (never historical ship/correct-shipment snapshots), and
+        # each group lists the still-unsigned orders alongside the distinct
+        # valid sign-off combinations recorded on its delivered orders. It
+        # never writes, never creates the data directory, never consumes a
+        # sequence, and never fabricates shipment info for legacy orders.
+        if not isinstance(stage, str):
+            raise ValueError("stage must be one of: open, all, conflict")
+        stage = stage.strip()
+        if stage not in ("open", "all", "conflict"):
+            raise ValueError("stage must be one of: open, all, conflict")
+        data = self._read()
+        groups = {}
+        for order in data.get("orders", {}).values():
+            if order.get("status") not in ("shipped", "delivered"):
+                continue
+            shipment = order.get("shipment")
+            # Same skip rule as shipment_orders: a missing or non-object
+            # shipment, or one whose required fields are missing, non-string
+            # or blank, cannot be grouped -- skip it rather than raising or
+            # fabricating info.
+            if not isinstance(shipment, dict):
+                continue
+            current_carrier = shipment.get("carrier")
+            current_tracking = shipment.get("tracking_no")
+            if not isinstance(current_carrier, str) or not isinstance(current_tracking, str):
+                continue
+            current_carrier = current_carrier.strip()
+            current_tracking = current_tracking.strip()
+            if not current_carrier or not current_tracking:
+                continue
+            key = (current_carrier, current_tracking)
+            group = groups.setdefault(key, {"pending": [], "invalid": [], "combos": {}})
+            order_id = order["order_id"]
+            if order["status"] == "shipped":
+                # A leftover delivery on a not-yet-signed order is legacy data
+                # and never takes part in the reconciliation.
+                group["pending"].append(order_id)
+                continue
+            # The order is delivered: a missing/non-object delivery, a missing
+            # or blank recipient, or an invalid text date invalidates this
+            # order's sign-off only; the query itself still succeeds.
+            try:
+                normalized = self._delivery_info(order.get("delivery"), "delivery")
+            except ValueError:
+                group["invalid"].append(order_id)
+                continue
+            combo = (normalized["recipient"], normalized["delivered_on"])
+            group["combos"].setdefault(combo, []).append(order_id)
+        result = []
+        for carrier, tracking_no in sorted(groups):
+            group = groups[(carrier, tracking_no)]
+            deliveries = []
+            # Distinct valid sign-off combinations sorted by recipient then
+            # date; orders sharing one combination are listed together.
+            for recipient, delivered_on in sorted(group["combos"]):
+                order_ids = group["combos"][(recipient, delivered_on)]
+                deliveries.append({
+                    "recipient": recipient,
+                    "delivered_on": delivered_on,
+                    "order_ids": sorted(order_ids),
+                })
+            pending_ids = sorted(group["pending"])
+            invalid_ids = sorted(group["invalid"])
+            conflict = len(deliveries) > 1 or bool(invalid_ids)
+            if stage == "conflict" and not conflict:
+                continue
+            if stage == "open" and not pending_ids and not conflict:
+                continue
+            result.append({
+                "carrier": carrier,
+                "tracking_no": tracking_no,
+                "pending_ids": pending_ids,
+                "deliveries": deliveries,
+                "invalid_ids": invalid_ids,
+                "conflict": conflict,
+            })
+        return result
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
