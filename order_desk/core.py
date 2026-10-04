@@ -2333,6 +2333,109 @@ class OrderDesk(JsonStore):
             "events": copy.deepcopy(document["events"]),
         }
 
+    @staticmethod
+    def _relation_snapshot_id(snapshot):
+        # Snapshot ids follow the same normalization as the query id: trim
+        # surrounding whitespace, stay case sensitive, reject everything that
+        # is not a nonempty string (booleans included).
+        value = snapshot.get("order_id")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("relation snapshot order_id must be a nonempty string")
+        return value.strip()
+
+    def order_relations(self, order_id):
+        # Read-only trace of every order connected to the queried one through
+        # split-order/merge-orders history: an event's direction always runs
+        # from its source snapshot to its target snapshot, and the trace walks
+        # both directions transitively, so only the start order and orders
+        # indirectly connected to it come back. Relations come solely from the
+        # split-order/merge-orders events in the CURRENT histories; later state
+        # changes never remove them and missing histories are never
+        # backfilled. The query never writes, creates a directory or consumes a
+        # sequence.
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        orders = data.get("orders", {})
+        if order_id not in orders:
+            raise ValueError("unknown order: " + order_id)
+        histories = data.get("history", {})
+        # (action, source_id, target_id) -> [(history owner, sequence), ...]:
+        # one edge per action/direction/id combination, carrying every
+        # matching event from BOTH endpoint histories as evidence. The mirror
+        # copies and the extra events produced when a merged-away source is
+        # reopened and merged again all survive as separate evidence.
+        edges = {}
+        for owner_id, document in histories.items():
+            for event in document.get("events", ()):
+                action = event.get("action")
+                if action not in ("split-order", "merge-orders"):
+                    # No other action establishes a relation.
+                    continue
+                result = event.get("result")
+                if not isinstance(result, dict):
+                    raise ValueError("relation event result must be an object")
+                source = result.get("source")
+                target = result.get("target")
+                if not isinstance(source, dict) or not isinstance(target, dict):
+                    raise ValueError("relation event source and target must be objects")
+                source_id = self._relation_snapshot_id(source)
+                target_id = self._relation_snapshot_id(target)
+                if source_id == target_id:
+                    raise ValueError("relation source and target must be different orders")
+                if owner_id != source_id and owner_id != target_id:
+                    raise ValueError("relation event history owner must be one of its endpoints")
+                if source_id not in orders or target_id not in orders:
+                    raise ValueError("relation event points at an order that does not exist")
+                edges.setdefault((action, source_id, target_id), []).append(
+                    (owner_id, event.get("sequence"))
+                )
+        # Walk the undirected component starting at the queried order; the
+        # visited set also makes cycles terminate without repeating orders.
+        adjacency = {}
+        for _, source_id, target_id in edges:
+            adjacency.setdefault(source_id, set()).add(target_id)
+            adjacency.setdefault(target_id, set()).add(source_id)
+        reachable = {order_id}
+        pending = [order_id]
+        while pending:
+            current = pending.pop()
+            for neighbor in adjacency.get(current, ()):
+                if neighbor not in reachable:
+                    reachable.add(neighbor)
+                    pending.append(neighbor)
+        related_orders = []
+        complete = True
+        for related_id in sorted(reachable):
+            document = histories.get(related_id)
+            # Missing history means a legacy order (complete=False); an
+            # existing document's flag is read exactly like history() does.
+            order_complete = False if document is None else document["complete"]
+            complete = complete and order_complete
+            related_orders.append({"order": orders[related_id], "complete": order_complete})
+        relations = []
+        for action, source_id, target_id in sorted(edges, key=lambda key: (key[1], key[2], key[0])):
+            if source_id not in reachable:
+                # Traversal follows these same edges, so an edge inside the
+                # component always has both endpoints reachable; edges between
+                # unrelated orders are left out of the result.
+                continue
+            evidence = [
+                {"order_id": owner, "sequence": sequence}
+                for owner, sequence in sorted(edges[(action, source_id, target_id)])
+            ]
+            relations.append({
+                "action": action,
+                "source_id": source_id,
+                "target_id": target_id,
+                "evidence": evidence,
+            })
+        return {
+            "order_id": order_id,
+            "orders": related_orders,
+            "relations": relations,
+            "complete": complete,
+        }
+
     def order_progress(self, order_id):
         # Read-only single-order fulfillment overview: the full order and
         # history results (identical to get/history) plus per-sku fulfillment
