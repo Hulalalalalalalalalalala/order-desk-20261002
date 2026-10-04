@@ -2359,6 +2359,95 @@ class OrderDesk(JsonStore):
         self._write(data)
         return result
 
+    def merge_returns(self, source_id, target_id, expected_source_lines, expected_target_lines):
+        # Whole-registration merge of two pending returns of the same order:
+        # the source's quantities are added into the target, which keeps its
+        # return_id and stays pending, while the source leaves the active
+        # records and rests in the cancelled stage with its original
+        # quantities (its id stays occupied for the whole root). Both expected
+        # lists are nonempty lists of sku/positive-integer lines (extra fields
+        # ignored, duplicate skus merged, booleans rejected) and are compared
+        # against the merged current records without regard to row order; both
+        # originals are always checked before anything changes. Both
+        # registrations must be different, active and unreceived, and must
+        # belong to the same shipped or delivered order; paused sales,
+        # unmanaged stock and a missing catalog entry never block the merge.
+        # Cumulative returned quantities, returnable allowance, fulfillment
+        # amounts, stock, reservations, order content and shipment/delivery
+        # info never change, no receipt or stock event is produced, and
+        # everything is validated before any mutation so a rejected merge
+        # leaves the file, sequences and every record untouched and never
+        # creates the data directory.
+        source_id = text(source_id, "source_id")
+        target_id = text(target_id, "target_id")
+        expected_source, _ = self._merged_return_lines(expected_source_lines, "expected_source_lines")
+        expected_target, _ = self._merged_return_lines(expected_target_lines, "expected_target_lines")
+        data = self._read()
+        located_source = self._find_return(data, source_id)
+        if located_source is None:
+            raise ValueError("unknown return: " + source_id)
+        source_order_id, source_record, source_cancelled = located_source
+        if source_cancelled:
+            raise ValueError("return already cancelled: " + source_id)
+        located_target = self._find_return(data, target_id)
+        if located_target is None:
+            raise ValueError("unknown return: " + target_id)
+        target_order_id, target_record, target_cancelled = located_target
+        if target_cancelled:
+            raise ValueError("return already cancelled: " + target_id)
+        if source_id == target_id:
+            raise ValueError("source and target must be different returns")
+        if source_order_id != target_order_id:
+            raise ValueError("only returns of the same order can be merged")
+        order_id = source_order_id
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped order can merge returns: " + order_id)
+        receipts = data.get("return_receipts", {})
+        if source_id in receipts:
+            raise ValueError("return already received: " + source_id)
+        if target_id in receipts:
+            raise ValueError("return already received: " + target_id)
+        source_current = {}
+        for line in source_record["lines"]:
+            source_current[line["sku"]] = source_current.get(line["sku"], 0) + line["quantity"]
+        target_current = {}
+        for line in target_record["lines"]:
+            target_current[line["sku"]] = target_current.get(line["sku"], 0) + line["quantity"]
+        # Both original contents are always checked, just like amend-return.
+        if expected_source != source_current:
+            raise ValueError("expected source lines do not match current lines")
+        if expected_target != target_current:
+            raise ValueError("expected target lines do not match current lines")
+        merged = dict(target_current)
+        for sku, quantity in source_current.items():
+            merged[sku] = merged.get(sku, 0) + quantity
+        # The snapshots carry only the registration structure (order_id,
+        # return_id, lines) with merged sku/quantity rows sorted by sku, so
+        # they never carry extra stored fields.
+        source_view = {"order_id": order_id, "return_id": source_id,
+                       "lines": [{"sku": sku, "quantity": source_current[sku]}
+                                 for sku in sorted(source_current)]}
+        target_before = {"order_id": order_id, "return_id": target_id,
+                         "lines": [{"sku": sku, "quantity": target_current[sku]}
+                                   for sku in sorted(target_current)]}
+        target_after = {"order_id": order_id, "return_id": target_id,
+                        "lines": [{"sku": sku, "quantity": merged[sku]}
+                                  for sku in sorted(merged)]}
+        result = {"source": source_view, "target_before": target_before, "target_after": target_after}
+        target_record["lines"] = target_after["lines"]
+        records = data["returns"][order_id]
+        records.remove(source_record)
+        if not records:
+            del data["returns"][order_id]
+        data.setdefault("cancelled_returns", {}).setdefault(order_id, []).append(copy.deepcopy(source_record))
+        # Both registrations belong to the same order, so the merge appends a
+        # single order-history event; the order sequence continues and legacy
+        # orders start at 1 with complete=False.
+        self._record_event(data, order_id, "merge-returns", result, False)
+        self._write(data)
+        return result
+
     def receive_return(self, return_id):
         return_id = text(return_id, "return_id")
         data = self._read()
