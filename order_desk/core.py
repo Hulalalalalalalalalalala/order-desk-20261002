@@ -2333,6 +2333,107 @@ class OrderDesk(JsonStore):
             "events": copy.deepcopy(document["events"]),
         }
 
+    def order_relations(self, order_id):
+        # Read-only split/merge tracing: starting from one order, follow the
+        # split-order and merge-orders events recorded in every current
+        # order's history in both directions and return the whole connected
+        # group. Relations come only from those events' source/target
+        # snapshots (direction is always source -> target); other events
+        # create none. Legacy orders without history get nothing fabricated,
+        # a one-sided event still links both ends, and later state changes
+        # never remove a recorded relation. It never writes, never creates
+        # the data directory and never consumes a sequence, so reopening the
+        # root gives the same result.
+        order_id = text(order_id, "order_id")
+        data = self._read()
+        orders = data.get("orders", {})
+        if order_id not in orders:
+            raise ValueError("unknown order: " + order_id)
+        history = data.get("history", {})
+        # Scan every current order's history first: one malformed split/merge
+        # event anywhere rejects the whole query instead of surfacing partial
+        # results. Snapshot ids are normalized with the query id rules
+        # (trimmed, case-sensitive).
+        linked = {}  # (action, source_id, target_id) -> {(owner_id, sequence)}
+        for owner_id in sorted(orders):
+            document = history.get(owner_id)
+            if document is None:
+                continue
+            for event in document.get("events", []):
+                if not isinstance(event, dict):
+                    continue
+                action = event.get("action")
+                if action not in ("split-order", "merge-orders"):
+                    continue
+                result = event.get("result")
+                if not isinstance(result, dict):
+                    raise ValueError("split/merge event result must be an object: " + owner_id)
+                source = result.get("source")
+                target = result.get("target")
+                if not isinstance(source, dict) or not isinstance(target, dict):
+                    raise ValueError(
+                        "split/merge event result must hold source and target objects: " + owner_id
+                    )
+                source_id = text(source.get("order_id"), "source order_id")
+                target_id = text(target.get("order_id"), "target order_id")
+                if source_id == target_id:
+                    raise ValueError(
+                        "split/merge event source and target must be different orders: " + owner_id
+                    )
+                if owner_id not in (source_id, target_id):
+                    raise ValueError(
+                        "split/merge event does not belong to this order's history: " + owner_id
+                    )
+                for end_id in (source_id, target_id):
+                    if end_id not in orders:
+                        raise ValueError(
+                            "split/merge event references an unknown order: " + end_id
+                        )
+                key = (action, source_id, target_id)
+                linked.setdefault(key, set()).add((owner_id, event.get("sequence")))
+        # Walk the group in both directions; cycles cannot duplicate orders
+        # or loop forever because every member is visited once.
+        adjacency = {}
+        for _, source_id, target_id in linked:
+            adjacency.setdefault(source_id, set()).add(target_id)
+            adjacency.setdefault(target_id, set()).add(source_id)
+        component = {order_id}
+        stack = [order_id]
+        while stack:
+            current = stack.pop()
+            for neighbor in adjacency.get(current, ()):
+                if neighbor not in component:
+                    component.add(neighbor)
+                    stack.append(neighbor)
+        group = []
+        all_complete = True
+        for member_id in sorted(component):
+            document = history.get(member_id)
+            complete = False if document is None else document["complete"]
+            all_complete = all_complete and complete
+            group.append({"order": copy.deepcopy(orders[member_id]), "complete": complete})
+        relations = []
+        for action, source_id, target_id in sorted(linked, key=lambda key: (key[1], key[2], key[0])):
+            if source_id not in component:
+                continue
+            evidence = sorted(
+                ({"order_id": owner, "sequence": sequence}
+                 for owner, sequence in linked[(action, source_id, target_id)]),
+                key=lambda item: (item["order_id"], item["sequence"]),
+            )
+            relations.append({
+                "action": action,
+                "source_id": source_id,
+                "target_id": target_id,
+                "evidence": evidence,
+            })
+        return {
+            "order_id": order_id,
+            "orders": group,
+            "relations": relations,
+            "complete": all_complete,
+        }
+
     def order_progress(self, order_id):
         # Read-only single-order fulfillment overview: the full order and
         # history results (identical to get/history) plus per-sku fulfillment
