@@ -2841,6 +2841,98 @@ class OrderDesk(JsonStore):
                 entries.append({"order_id": order_id, "tasks": tasks, "progress": progress})
         return entries
 
+    @staticmethod
+    def _stored_delivery(value):
+        # Read-only validation of a delivered order's stored sign-off: a valid
+        # record normalizes exactly like confirm-delivery input (trimmed
+        # nonempty recipient, real YYYY-MM-DD date, extra fields ignored),
+        # while anything missing, non-object or field-invalid reports None so
+        # the worklist lists that order under invalid_ids instead of rejecting
+        # the whole query.
+        if not isinstance(value, dict):
+            return None
+        try:
+            recipient = text(value.get("recipient"), "recipient")
+            delivered_on = calendar_date(value.get("delivered_on"), "delivered_on")
+        except ValueError:
+            return None
+        return {"recipient": recipient, "delivered_on": delivered_on}
+
+    def shipment_worklist(self, stage="open"):
+        # Read-only shipment sign-off checklist: shipped and delivered orders
+        # are grouped by their CURRENT shipment's normalized carrier +
+        # tracking number (never historical ship/correct-shipment snapshots),
+        # and each group is checked for unsigned orders and inconsistent
+        # sign-offs. It never writes, never creates the data directory, never
+        # consumes a sequence, and never fabricates shipment or delivery info.
+        if not isinstance(stage, str):
+            raise ValueError("stage must be one of: open, all, conflict")
+        stage = stage.strip()
+        if stage not in ("open", "all", "conflict"):
+            raise ValueError("stage must be one of: open, all, conflict")
+        data = self._read()
+        groups = {}
+        for order in data.get("orders", {}).values():
+            if order.get("status") not in ("shipped", "delivered"):
+                continue
+            shipment = order.get("shipment")
+            # Invalid shipment info follows shipment-orders' skip rule: a
+            # missing or non-object shipment, or one whose required fields are
+            # missing, non-string or blank, cannot be grouped and is skipped
+            # rather than raising or fabricated.
+            if not isinstance(shipment, dict):
+                continue
+            current_carrier = shipment.get("carrier")
+            current_tracking = shipment.get("tracking_no")
+            if not isinstance(current_carrier, str) or not isinstance(current_tracking, str):
+                continue
+            current_carrier = current_carrier.strip()
+            current_tracking = current_tracking.strip()
+            if not current_carrier or not current_tracking:
+                continue
+            group = groups.setdefault(
+                (current_carrier, current_tracking),
+                {"pending_ids": [], "deliveries": {}, "invalid_ids": []},
+            )
+            order_id = order["order_id"]
+            if order.get("status") == "shipped":
+                # A leftover delivery on an unsigned order never participates
+                # in the check; the order is simply pending.
+                group["pending_ids"].append(order_id)
+                continue
+            delivery = self._stored_delivery(order.get("delivery"))
+            if delivery is None:
+                group["invalid_ids"].append(order_id)
+            else:
+                key = (delivery["recipient"], delivery["delivered_on"])
+                group["deliveries"].setdefault(key, []).append(order_id)
+        result = []
+        for carrier, tracking_no in sorted(groups):
+            group = groups[(carrier, tracking_no)]
+            pending_ids = sorted(group["pending_ids"])
+            invalid_ids = sorted(group["invalid_ids"])
+            deliveries = []
+            for recipient, delivered_on in sorted(group["deliveries"]):
+                deliveries.append({
+                    "recipient": recipient,
+                    "delivered_on": delivered_on,
+                    "order_ids": sorted(group["deliveries"][(recipient, delivered_on)]),
+                })
+            conflict = len(deliveries) > 1 or bool(invalid_ids)
+            if stage == "conflict" and not conflict:
+                continue
+            if stage == "open" and not pending_ids and not conflict:
+                continue
+            result.append({
+                "carrier": carrier,
+                "tracking_no": tracking_no,
+                "pending_ids": pending_ids,
+                "deliveries": deliveries,
+                "invalid_ids": invalid_ids,
+                "conflict": conflict,
+            })
+        return result
+
     def stock_history(self, sku):
         sku = text(sku, "sku")
         data = self._read()
