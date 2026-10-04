@@ -1614,6 +1614,75 @@ class OrderDesk(JsonStore):
             self._write(data)
         return {"carrier": carrier, "tracking_no": tracking_no, "orders": matched}
 
+    @staticmethod
+    def _delivery_info(value, label):
+        # Normalizes a delivery object: it must be an object whose recipient
+        # is a nonempty string after trimming and whose delivered_on is a real
+        # YYYY-MM-DD calendar date; extra fields are ignored. Used for both
+        # the supplied deliveries and the stored one.
+        if not isinstance(value, dict):
+            raise ValueError(label + " must be an object with recipient and delivered_on")
+        recipient = text(value.get("recipient"), "recipient")
+        delivered_on = calendar_date(value.get("delivered_on"), "delivered_on")
+        return {"recipient": recipient, "delivered_on": delivered_on}
+
+    def correct_shipment_delivery(self, carrier, tracking_no, expected_delivery, delivery):
+        # Bulk correction of recorded sign-offs: every order currently
+        # delivered under one carrier + tracking number combination has its
+        # delivery info replaced at once, but only after each stored delivery
+        # is checked against the expected original -- a missing, non-object,
+        # invalid or conflicting stored delivery rejects the whole request,
+        # even when the target changes nothing. The matching rule is
+        # shipment_orders' restricted to delivered orders: only the order's
+        # current shipment object counts, never historical snapshots, and
+        # invalid shipments are skipped. Either the recipient or the date may
+        # be corrected on its own. Lines, amounts, shipment, stock,
+        # reservations, carts and existing returns are never touched, returns
+        # never block the correction, and no stock events are added.
+        carrier = text(carrier, "carrier")
+        tracking_no = text(tracking_no, "tracking_no")
+        expected = self._delivery_info(expected_delivery, "expected_delivery")
+        target = self._delivery_info(delivery, "delivery")
+        data = self._read()
+        matched = []
+        for order in data.get("orders", {}).values():
+            if order.get("status") != "delivered":
+                continue
+            shipment = order.get("shipment")
+            # A missing or non-object shipment, or one whose required fields
+            # are missing, non-string or blank, simply cannot match.
+            if not isinstance(shipment, dict):
+                continue
+            current_carrier = shipment.get("carrier")
+            current_tracking = shipment.get("tracking_no")
+            if not isinstance(current_carrier, str) or not isinstance(current_tracking, str):
+                continue
+            current_carrier = current_carrier.strip()
+            current_tracking = current_tracking.strip()
+            if not current_carrier or not current_tracking:
+                continue
+            if current_carrier != carrier or current_tracking != tracking_no:
+                continue
+            matched.append(order)
+        if not matched:
+            raise ValueError("no orders match this shipment")
+        matched.sort(key=lambda order: order["order_id"])
+        # Verify every stored delivery against the expected original before
+        # mutating anything, so a mismatch leaves the file, sequences and
+        # every order untouched.
+        for order in matched:
+            current = self._delivery_info(order.get("delivery"), "delivery")
+            if current != expected:
+                raise ValueError("expected delivery does not match current delivery: " + order["order_id"])
+        if target != expected:
+            # When the target equals the current info the result is still
+            # returned, but no file is written and no event is appended.
+            for order in matched:
+                order["delivery"] = dict(target)
+                self._record_event(data, order["order_id"], "correct-delivery", order, False)
+            self._write(data)
+        return {"carrier": carrier, "tracking_no": tracking_no, "orders": matched}
+
     def pick_list(self, order_ids):
         # Read-only picking summary across the selected placed orders: it merges
         # quantities by sku while keeping per-order demand and reservation
