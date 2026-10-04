@@ -2229,6 +2229,85 @@ class OrderDesk(JsonStore):
         self._write(data)
         return result
 
+    def split_return(self, source_id, target_id, expected_lines, lines):
+        # Split part of a pending return registration into a new registration
+        # under a fresh return_id (an order or cart with the same name never
+        # blocks it): the source keeps its id and order with the remaining
+        # quantities, the target receives the moved quantities, and both stay
+        # pending registrations that follow the existing receive and cancel
+        # flows. The original content is checked first; the moved quantities
+        # are then taken only from the source registration, never exceeding it,
+        # and the source may not be emptied. Paused sales, unmanaged stock and
+        # a missing catalog entry never block a split. The split never touches
+        # cumulative returned quantities, returnable allowance, stock,
+        # reservations or the order itself, and produces no receipt or stock
+        # event. Everything is validated before any mutation, so a rejected
+        # split leaves the file, sequences and every record untouched and
+        # never creates the data directory.
+        source_id = text(source_id, "source_id")
+        target_id = text(target_id, "target_id")
+        expected, _ = self._merged_return_lines(expected_lines, "expected_lines")
+        requested, _ = self._merged_return_lines(lines, "lines")
+        data = self._read()
+        located = self._find_return(data, source_id)
+        if located is None:
+            raise ValueError("unknown return: " + source_id)
+        order_id, record, cancelled = located
+        if cancelled:
+            raise ValueError("return already cancelled: " + source_id)
+        if source_id in data.get("return_receipts", {}):
+            # Legacy registrations without a receipt read as pending.
+            raise ValueError("return already received: " + source_id)
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped order can split a return: " + order_id)
+        if source_id == target_id:
+            raise ValueError("source and target must be different returns")
+        # Active, received and cancelled registrations all occupy their id for
+        # the whole root.
+        if self._find_return(data, target_id) is not None:
+            raise ValueError("return already exists: " + target_id)
+        current = {}
+        for line in record["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        # The original content is always checked before any quantity logic.
+        if expected != current:
+            raise ValueError("expected lines do not match current lines")
+        for sku, quantity in requested.items():
+            if sku not in current:
+                raise ValueError("sku not in return: " + sku)
+            if quantity > current[sku]:
+                raise ValueError("split quantity exceeds returned quantity: " + sku)
+        # Moving every line away empties the source and is rejected here.
+        if sum(current[sku] - requested.get(sku, 0) for sku in current) == 0:
+            raise ValueError("cannot split the whole return")
+        before = {
+            "order_id": order_id,
+            "return_id": source_id,
+            "lines": [{"sku": sku, "quantity": current[sku]} for sku in sorted(current)],
+        }
+        # Both sides are merged by sku, sorted ascending, with zero-quantity
+        # rows removed.
+        source_lines = [
+            {"sku": sku, "quantity": current[sku] - requested.get(sku, 0)}
+            for sku in sorted(current)
+            if current[sku] - requested.get(sku, 0)
+        ]
+        target_lines = [{"sku": sku, "quantity": requested[sku]} for sku in sorted(requested)]
+        record["lines"] = source_lines
+        target = {"order_id": order_id, "return_id": target_id, "lines": target_lines}
+        data.setdefault("returns", {}).setdefault(order_id, []).append(target)
+        result = {
+            "before": before,
+            "source": {"order_id": order_id, "return_id": source_id, "lines": source_lines},
+            "target": target,
+        }
+        # One order history event carries the full snapshot; the sequence
+        # continues and legacy orders start at 1 with complete=False.
+        self._record_event(data, order_id, "split-return", result, False)
+        self._write(data)
+        return result
+
     def receive_return(self, return_id):
         return_id = text(return_id, "return_id")
         data = self._read()
