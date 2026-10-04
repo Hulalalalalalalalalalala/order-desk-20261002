@@ -1755,6 +1755,59 @@ class OrderDesk(JsonStore):
         self._write(data)
         return {"carrier": carrier, "tracking_no": tracking_no, "orders": matched}
 
+    def revoke_shipment_delivery(self, carrier, tracking_no, expected_delivery):
+        # Bulk revocation of recorded sign-offs for one carrier + tracking
+        # number combination: every selected order goes back to shipped and
+        # loses its delivery record, so it can be signed again through the
+        # usual entries. Only orders currently delivered under the combination
+        # qualify (shipped matches are not selected), and the expected
+        # delivery's normalized recipient/delivered_on must match every
+        # selected order's current delivery before anything is revoked.
+        # Matching uses only the order's current shipment object, never
+        # historical snapshots. Lines, amounts, shipment, stock, reservations,
+        # carts and existing returns are never touched, returns never block a
+        # revocation, and no stock events are added.
+        carrier = text(carrier, "carrier")
+        tracking_no = text(tracking_no, "tracking_no")
+        expected = self._delivery_info(expected_delivery, "expected_delivery")
+        data = self._read()
+        matched = []
+        for order in data.get("orders", {}).values():
+            # Only delivered orders are selected; shipped and every other
+            # status never are, even when their shipment matches.
+            if order.get("status") != "delivered":
+                continue
+            shipment = order.get("shipment")
+            # A missing or non-object shipment, or one whose required fields
+            # are missing, non-string or blank, simply cannot match.
+            if not isinstance(shipment, dict):
+                continue
+            current_carrier = shipment.get("carrier")
+            current_tracking = shipment.get("tracking_no")
+            if not isinstance(current_carrier, str) or not isinstance(current_tracking, str):
+                continue
+            if current_carrier.strip() != carrier or current_tracking.strip() != tracking_no:
+                continue
+            matched.append(order)
+        if not matched:
+            raise ValueError("no delivered orders match this shipment")
+        matched.sort(key=lambda order: order["order_id"])
+        # Check every selected order's current delivery against the expected
+        # delivery before mutating anything, so a missing, malformed or
+        # conflicting stored delivery leaves the file, sequences and every
+        # order untouched.
+        for order in matched:
+            current = self._delivery_info(order.get("delivery"), "delivery")
+            if expected != current:
+                raise ValueError("expected delivery does not match current delivery: " + order["order_id"])
+        # All checks passed: every selected order is revoked together.
+        for order in matched:
+            order["status"] = "shipped"
+            order.pop("delivery", None)
+            self._record_event(data, order["order_id"], "revoke-delivery", order, False)
+        self._write(data)
+        return {"carrier": carrier, "tracking_no": tracking_no, "orders": matched}
+
     def pick_list(self, order_ids):
         # Read-only picking summary across the selected placed orders: it merges
         # quantities by sku while keeping per-order demand and reservation
