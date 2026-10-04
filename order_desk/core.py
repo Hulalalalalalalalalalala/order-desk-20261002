@@ -2229,6 +2229,83 @@ class OrderDesk(JsonStore):
         self._write(data)
         return result
 
+    def split_return(self, source_id, target_id, expected_lines, lines):
+        # Split part of a pending return registration into a brand-new return
+        # id: the source registration keeps its id and order with the remaining
+        # quantities, and the moved quantities become a separate pending
+        # registration under the target id, so the two registrations can later
+        # be received or cancelled independently through the existing flows.
+        # Both lists are nonempty lists of sku/positive-integer lines (extra
+        # fields ignored, duplicate skus merged, booleans rejected); the
+        # expected list is compared against the merged current record without
+        # regard to row order. The source must be an active registration with
+        # no receipt whose order is shipped or delivered; the target id must
+        # differ from the source and must not be occupied by any active,
+        # received or cancelled return in the whole root, but it may share a
+        # name with an order or a cart. Moved quantities may only come from the
+        # current registration, cannot exceed it and cannot take it all (the
+        # source must stay nonempty); paused sales, unmanaged stock and a
+        # missing catalog entry never block the split. Cumulative returned
+        # quantities, returnable allowance, stock, reservations and order
+        # content never change, no receipt or stock event is produced, and
+        # everything is validated before any mutation so a rejected split
+        # leaves the file, sequences and every record untouched and never
+        # creates the data directory.
+        source_id = text(source_id, "source_id")
+        target_id = text(target_id, "target_id")
+        expected, _ = self._merged_return_lines(expected_lines, "expected_lines")
+        moved, target_lines = self._merged_return_lines(lines, "lines")
+        data = self._read()
+        located = self._find_return(data, source_id)
+        if located is None:
+            raise ValueError("unknown return: " + source_id)
+        order_id, record, cancelled = located
+        if cancelled:
+            raise ValueError("return already cancelled: " + source_id)
+        order = data.get("orders", {}).get(order_id)
+        if order is None or order["status"] not in ("shipped", "delivered"):
+            raise ValueError("only a shipped order can split a return: " + order_id)
+        if source_id in data.get("return_receipts", {}):
+            raise ValueError("return already received: " + source_id)
+        if target_id == source_id:
+            raise ValueError("source and target must be different returns")
+        # Return ids are occupied for the whole root by active, received and
+        # cancelled registrations; order and cart ids never block the name.
+        if self._find_return(data, target_id) is not None or target_id in data.get("return_receipts", {}):
+            raise ValueError("return already exists: " + target_id)
+        current = {}
+        for line in record["lines"]:
+            current[line["sku"]] = current.get(line["sku"], 0) + line["quantity"]
+        # The original content is always checked first, just like amend-return.
+        if expected != current:
+            raise ValueError("expected lines do not match current lines")
+        remaining = dict(current)
+        for sku, quantity in moved.items():
+            if sku not in current:
+                raise ValueError("sku not in return: " + sku)
+            if quantity > current[sku]:
+                raise ValueError("split quantity exceeds returned quantity: " + sku)
+            remaining[sku] -= quantity
+        # Taking every line away would be a whole-registration cancellation,
+        # which cancel_return already handles; the source must stay nonempty.
+        if not any(quantity > 0 for quantity in remaining.values()):
+            raise ValueError("cannot split the whole return; cancel it instead")
+        before = {"order_id": order_id, "return_id": source_id,
+                  "lines": [{"sku": sku, "quantity": current[sku]} for sku in sorted(current)]}
+        source_view = {"order_id": order_id, "return_id": source_id,
+                       "lines": [{"sku": sku, "quantity": remaining[sku]}
+                                 for sku in sorted(remaining) if remaining[sku] > 0]}
+        target_record = {"order_id": order_id, "return_id": target_id, "lines": target_lines}
+        result = {"before": before, "source": source_view, "target": target_record}
+        record["lines"] = source_view["lines"]
+        data["returns"][order_id].append(target_record)
+        # Both registrations belong to the same order, so the split appends a
+        # single order-history event; the order sequence continues and legacy
+        # orders start at 1 with complete=False.
+        self._record_event(data, order_id, "split-return", result, False)
+        self._write(data)
+        return result
+
     def receive_return(self, return_id):
         return_id = text(return_id, "return_id")
         data = self._read()
